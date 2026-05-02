@@ -10,10 +10,10 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![n8n compatible](https://img.shields.io/badge/n8n-2.10.1%2B-FF6E5C.svg)](https://n8n.io)
-[![Templates](https://img.shields.io/badge/templates-5%20live-brightgreen.svg)](#templates)
+[![Templates](https://img.shields.io/badge/templates-10%20live-brightgreen.svg)](#templates)
 [![CI](https://github.com/studiomeyer-io/n8n-workflows/actions/workflows/validate-workflows.yml/badge.svg)](https://github.com/studiomeyer-io/n8n-workflows/actions)
 
-CRM router · Stripe · uptime · SSL watcher · Slack digest · multi-provider LLM · no memory required
+CRM router · Stripe · uptime · SSL · Slack digest · Calendly · GitHub · RSS · calendar conflicts · CSV validator · no memory required
 
 [Quick Start](#quick-start) · [Templates](#templates) · [Production Patterns](#production-patterns) · [Memory Variant](#memory-variant)
 
@@ -53,8 +53,13 @@ Detailed walkthrough per template lives inside each `templates/NN-slug/README.md
 | 3 | [Uptime Monitor with Alerts](./templates/03-uptime-monitor-with-alerts/) | Schedule cron | none | rate limit, idempotency, error branch | Hardened (v0.1.0) |
 | 4 | [SSL Certificate Expiry Watcher](./templates/04-ssl-certificate-expiry-watcher/) | Schedule daily | none | rate limit, error branch | Hardened (v0.1.0) |
 | 5 | [Slack Channel Daily Digest](./templates/05-slack-channel-daily-digest/) | Schedule daily | yes (multi-provider) | rate limit, idempotency, error branch | Hardened (v0.1.0) |
+| 6 | [Calendly to CRM Sync](./templates/06-calendly-to-crm-sync/) | Calendly v2 webhook | none | HMAC (Calendly v2 + replay-window), rate limit, idempotency, error branch | Hardened (v0.2.0) |
+| 7 | [GitHub Issues Router](./templates/07-github-issues-to-tracker/) | GitHub webhook | none | HMAC (`X-Hub-Signature-256`), rate limit, idempotency on `X-GitHub-Delivery`, error branch | Hardened (v0.2.0) |
+| 8 | [RSS to Multi-Channel Social](./templates/08-rss-to-multi-channel-social/) | Schedule cron | none | rate limit (per-feed-host), 7-day idempotency on guid, per-channel error branch | Hardened (v0.2.0) |
+| 9 | [Calendar Conflict Detector](./templates/09-calendar-conflict-detector/) | Schedule daily | none | rate limit (per-calendar), 24h idempotency on conflict-pair hash, per-calendar error branch | Hardened (v0.2.0) |
+| 10 | [CSV Bulk Validator](./templates/10-csv-bulk-validator/) | Webhook (CSV upload) | none | HMAC + replay-window, rate limit, idempotency on `sha256(rawBody)`, ReDoS-protected schema regexes, error branch | Hardened (v0.2.0) |
 
-T01 is the BANT scoring + multi-CRM router (Pipedrive / HubSpot / Salesforce switch). T02 is the Stripe webhook with proper signature verification and per-event-type Slack messages. T03 is the schedule-based HTTP uptime check with retry-with-backoff and Slack/Telegram alerts. T04 is the daily SSL cert expiry watcher across multiple domains. T05 is the multi-provider LLM Slack digest (Claude / OpenAI / Gemini fallback chain).
+T01 is the BANT scoring + multi-CRM router (Pipedrive / HubSpot / Salesforce switch). T02 is the Stripe webhook with proper signature verification and per-event-type Slack messages. T03 is the schedule-based HTTP uptime check with retry-with-backoff and Slack/Telegram alerts. T04 is the daily SSL cert expiry watcher across multiple domains. T05 is the multi-provider LLM Slack digest (Claude / OpenAI / Gemini fallback chain). T06 mirrors Calendly v2 booking events into the same multi-CRM Switch as T01 (Pipedrive default). T07 mirrors GitHub issue events into a multi-tracker Switch (Linear default GraphQL, Jira REST, ClickUp REST), then comments back on the GitHub issue with the tracker URL. T08 fans out RSS items into X / LinkedIn / Discord with per-channel error branches and a 7-day in-memory dedup window. T09 polls Google Calendar v3 or Microsoft Graph for the next 7 days and posts a Slack alert per detected double-booking with 24h dedup. T10 accepts a CSV upload (HMAC-signed and replay-window protected when configured) and returns a structured `{valid, invalid, summary}` report.
 
 More templates land per release cadence. See [STATUS.md](./STATUS.md) for ground truth on what is hardened, what is in-progress, and what is on the roadmap.
 
@@ -176,7 +181,12 @@ n8n-workflows/
     ├── 02-stripe-lifecycle-to-slack/
     ├── 03-uptime-monitor-with-alerts/
     ├── 04-ssl-certificate-expiry-watcher/
-    └── 05-slack-channel-daily-digest/
+    ├── 05-slack-channel-daily-digest/
+    ├── 06-calendly-to-crm-sync/
+    ├── 07-github-issues-to-tracker/
+    ├── 08-rss-to-multi-channel-social/
+    ├── 09-calendar-conflict-detector/
+    └── 10-csv-bulk-validator/
 ```
 
 Each template folder is self-contained. Copy any one of them out of this repo and it still works.

@@ -1,0 +1,412 @@
+{
+  "name": "GitHub Issues Router (Linear / Jira / ClickUp)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## GitHub Issues Router\n\nGitHub `issues` webhook lands here, payload is HMAC-verified (`X-Hub-Signature-256`), normalized, classified by label, and routed to the configured tracker (Linear default, Jira, or ClickUp). The original GitHub issue gets a follow-up comment with the tracker URL.\n\n**Production patterns wired:**\n- HMAC verify (opt-in, `GITHUB_WEBHOOK_SECRET`)\n- Rate limit (opt-in, `RATE_LIMIT_ENABLED=1`)\n- Idempotency on `X-GitHub-Delivery` (opt-in, `IDEMPOTENCY_ENABLED=1`)\n- Error branches with structured fallback\n\nSee `README.md` for setup, env vars, and extension recipes.",
+        "height": 320,
+        "width": 400,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Create the GitHub webhook in repo Settings -> Webhooks. URL = this workflow's webhook URL. Content type = `application/json`. Secret = strong random string.\n2. Set `GITHUB_WEBHOOK_SECRET` to the same secret in your n8n env.\n3. Set `TRACKER_TARGET=linear` (or `jira` or `clickup`).\n4. Set tracker IDs: Linear -> `LINEAR_TEAM_ID`. Jira -> `JIRA_PROJECT_KEY` + `JIRA_BASE_URL`. ClickUp -> `CLICKUP_LIST_ID`.\n5. Configure Slack webhook URL in `SLACK_OPS_WEBHOOK` for error notifications.\n6. Self-hosted n8n: set `NODE_FUNCTION_ALLOW_BUILTIN=crypto`.",
+        "height": 320,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 240]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\nFour patterns wired as opt-in nodes. Default-off via env vars so import boots clean.\n\n- **HMAC verify:** `GITHUB_WEBHOOK_SECRET` + `WEBHOOK_INTEGRITY_CHECK_ENABLED=1` (`X-Hub-Signature-256` `sha256=<hex>` format)\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 req / 5 min / IP)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (5-min window on `X-GitHub-Delivery`)\n- **Error branch:** always on. Every HTTP node has `onError: continueErrorOutput` wired to the Error Fallback Code node.\n\nFor clustered n8n, swap the in-memory dedup for Redis SET NX EX 300. Snippet in each opt-in node's comments.",
+        "height": 320,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "github-issues",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "gh-1-trigger",
+      "name": "GitHub Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 60],
+      "webhookId": "github-issues"
+    },
+    {
+      "parameters": {
+        "jsCode": "// GitHub HMAC-SHA256 signature verification, opt-in.\n// Header: X-Hub-Signature-256 with format `sha256=<hex>`.\n// Enable by setting GITHUB_WEBHOOK_SECRET + WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n\nconst secret = $env.GITHUB_WEBHOOK_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.rawBody || (typeof item.body === 'string' ? item.body : JSON.stringify(item.body || {}));\nconst headers = item.headers || {};\nconst sigHeader = headers['x-hub-signature-256'] || headers['X-Hub-Signature-256'];\n\nif (!sigHeader || typeof sigHeader !== 'string') {\n  throw new Error('UNAUTHORIZED: missing X-Hub-Signature-256 header');\n}\n\n// Strip the `sha256=` prefix\nif (!sigHeader.startsWith('sha256=')) {\n  throw new Error('UNAUTHORIZED: malformed signature header (expected sha256= prefix)');\n}\nconst providedSig = sigHeader.slice('sha256='.length);\n\nconst expected = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex');\n\nif (providedSig.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expBuf = Buffer.from(expected, 'utf8');\nconst provBuf = Buffer.from(providedSig, 'utf8');\nif (!crypto.timingSafeEqual(expBuf, provBuf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
+      },
+      "id": "gh-pp-1-verify",
+      "name": "Verify Webhook (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-IP sliding-window rate limit, opt-in. Same pattern as the other templates.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst headers = item.headers || {};\nconst rawIp = headers['x-forwarded-for'] || headers['x-real-ip'] || 'unknown';\nconst key = String(rawIp).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];"
+      },
+      "id": "gh-pp-2-ratelimit",
+      "name": "Rate Limit (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 5-minute idempotency window on X-GitHub-Delivery, opt-in.\n// GitHub's per-delivery UUID is the canonical idempotency key.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 10000;\n\nconst item = $input.first();\nconst headers = item.headers || {};\nconst deliveryId = headers['x-github-delivery'] || headers['X-GitHub-Delivery'];\n\nif (!deliveryId) {\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 1000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[deliveryId]) {\n  return [{ json: { skipped: true, reason: 'duplicate', deliveryId } }];\n}\nseen[deliveryId] = now;\n\nreturn [$input.first()];"
+      },
+      "id": "gh-pp-3-idempotency",
+      "name": "Idempotency Check (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter event types. Only forward issues.opened / reopened / labeled.\n// GitHub sends one webhook per `Issues` event. The action field tells us which.\n// Returns [] (empty array) for non-forwarded actions so the branch halts cleanly.\n\nconst body = $input.first().body || {};\nconst action = body.action || 'unknown';\nconst FORWARD_ACTIONS = ['opened', 'reopened', 'labeled'];\n\nif (!FORWARD_ACTIONS.includes(action)) {\n  // Halt branch. Returning [] (not a sentinel object) prevents downstream nodes\n  // from running with empty data and creating blank tracker tickets.\n  return [];\n}\n\nreturn [$input.first()];"
+      },
+      "id": "gh-2-filter",
+      "name": "Filter Event Type",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize GitHub issue payload into a stable schema.\n\nconst body = $input.first().body || {};\nconst issue = body.issue || {};\nconst repo = body.repository || {};\nconst sender = body.sender || {};\nconst headers = $input.first().headers || {};\n\nconst labels = Array.isArray(issue.labels) ? issue.labels.map(l => String(l && l.name || '').toLowerCase()).filter(Boolean) : [];\n\nreturn [{\n  json: {\n    deliveryId: headers['x-github-delivery'] || headers['X-GitHub-Delivery'] || ('unknown-' + Date.now()),\n    action: body.action,\n    issueNumber: issue.number,\n    issueId: issue.id,\n    issueTitle: issue.title || 'Untitled',\n    issueBody: issue.body || '',\n    issueUrl: issue.html_url,\n    issueState: issue.state,\n    repoFullName: repo.full_name,\n    repoUrl: repo.html_url,\n    reporterLogin: sender.login,\n    labels,\n    receivedAt: new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "gh-3-normalize",
+      "name": "Normalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Classify the issue type from labels. Bug / feature / chore are the canonical buckets.\n// Override the rubric for your team's labels.\n\nconst input = $input.first().json;\nconst labels = input.labels || [];\n\nlet issueType = 'task';\nlet priority = 'normal';\n\nif (labels.some(l => /bug|defect|broken|regression/.test(l))) issueType = 'bug';\nelse if (labels.some(l => /feature|enhancement|request/.test(l))) issueType = 'feature';\nelse if (labels.some(l => /chore|maintenance|refactor|cleanup/.test(l))) issueType = 'chore';\nelse if (labels.some(l => /docs|documentation/.test(l))) issueType = 'docs';\n\nif (labels.some(l => /critical|p0|urgent|sev-1/.test(l))) priority = 'urgent';\nelse if (labels.some(l => /high|p1|sev-2/.test(l))) priority = 'high';\nelse if (labels.some(l => /low|p3|p4/.test(l))) priority = 'low';\n\nreturn [{\n  json: {\n    ...input,\n    issueType,\n    priority,\n  },\n}];"
+      },
+      "id": "gh-4-classify",
+      "name": "Classify by Labels",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pick tracker target from env. Default linear.\n\nconst input = $input.first().json;\nconst trackerTarget = ($env.TRACKER_TARGET || 'linear').toLowerCase();\n\nreturn [{\n  json: {\n    ...input,\n    trackerTarget,\n  },\n}];"
+      },
+      "id": "gh-5-set-routing",
+      "name": "Set Tracker Target",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 60]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.trackerTarget }}",
+                    "rightValue": "linear",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "outputKey": "linear"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.trackerTarget }}",
+                    "rightValue": "jira",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "outputKey": "jira"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.trackerTarget }}",
+                    "rightValue": "clickup",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "outputKey": "clickup"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "gh-6-route",
+      "name": "Route by Tracker",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1840, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.linear.app/graphql",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $credentials.linearApi.apiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: 'mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url title } } }', variables: { input: { teamId: $env.LINEAR_TEAM_ID, title: '[' + $json.issueType + '] ' + $json.issueTitle + ' (#' + $json.issueNumber + ')', description: ($json.issueBody || '') + '\\n\\n---\\nMirrored from GitHub: ' + $json.issueUrl, priority: ({ urgent: 1, high: 2, normal: 3, low: 4 })[$json.priority] || 3 } } }) }}",
+        "options": {}
+      },
+      "id": "gh-7a-linear",
+      "name": "Linear Create Issue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2040, -100],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.JIRA_BASE_URL || 'https://your-company.atlassian.net') + '/rest/api/2/issue' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fields: { project: { key: $env.JIRA_PROJECT_KEY }, summary: '[' + $json.issueType + '] ' + $json.issueTitle + ' (#' + $json.issueNumber + ')', description: ($json.issueBody || '') + '\\n\\nMirrored from GitHub: ' + $json.issueUrl, issuetype: { name: ({ bug: 'Bug', feature: 'Story', chore: 'Task', docs: 'Task', task: 'Task' })[$json.issueType] || 'Task' }, priority: { name: ({ urgent: 'Highest', high: 'High', normal: 'Medium', low: 'Low' })[$json.priority] || 'Medium' } } }) }}",
+        "options": {}
+      },
+      "id": "gh-7b-jira",
+      "name": "Jira Create Issue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2040, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.clickup.com/api/v2/list/' + $env.CLICKUP_LIST_ID + '/task' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $credentials.clickUpApi.accessToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ name: '[' + $json.issueType + '] ' + $json.issueTitle + ' (#' + $json.issueNumber + ')', description: ($json.issueBody || '') + '\\n\\nMirrored from GitHub: ' + $json.issueUrl, priority: ({ urgent: 1, high: 2, normal: 3, low: 4 })[$json.priority] || 3, tags: [$json.issueType] }) }}",
+        "options": {}
+      },
+      "id": "gh-7c-clickup",
+      "name": "ClickUp Create Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2040, 220],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize tracker response into a unified shape.\n// Linear returns { data: { issueCreate: { issue: { id, identifier, url, title } } } }\n// Jira returns { id, key, self }\n// ClickUp returns { id, name, url, ... }\n\nconst input = $input.first();\nconst body = input.json || {};\n\nlet trackerId = null;\nlet trackerUrl = null;\nlet trackerLabel = null;\n\nif (body.data && body.data.issueCreate && body.data.issueCreate.issue) {\n  const iss = body.data.issueCreate.issue;\n  trackerId = iss.id;\n  trackerUrl = iss.url;\n  trackerLabel = iss.identifier || iss.title || iss.id;\n} else if (body.key && body.self) {\n  trackerId = body.id;\n  trackerLabel = body.key;\n  // Jira self looks like https://X.atlassian.net/rest/api/2/issue/<id>; build browse URL\n  const baseMatch = String(body.self).match(/^(https?:\\/\\/[^\\/]+)/);\n  trackerUrl = baseMatch ? (baseMatch[1] + '/browse/' + body.key) : null;\n} else if (body.id && body.url) {\n  trackerId = body.id;\n  trackerUrl = body.url;\n  trackerLabel = body.id;\n}\n\nreturn [{\n  json: {\n    ...body,\n    trackerId,\n    trackerUrl,\n    trackerLabel,\n    trackerSuccess: !!trackerId,\n  },\n}];"
+      },
+      "id": "gh-8-normalize-tracker",
+      "name": "Normalize Tracker Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.github.com/repos/' + $('Set Tracker Target').first().json.repoFullName + '/issues/' + $('Set Tracker Target').first().json.issueNumber + '/comments' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.githubApi.accessToken }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ body: ':link: Mirrored to ' + $('Set Tracker Target').first().json.trackerTarget + ': ' + ($json.trackerLabel || $json.trackerId || 'created') + (' ' + ($json.trackerUrl || '')) }) }}",
+        "options": {}
+      },
+      "id": "gh-9-comment",
+      "name": "Comment on GitHub Issue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, trackerLabel: $json.trackerLabel, trackerUrl: $json.trackerUrl }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "gh-10-respond",
+      "name": "Respond to GitHub",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback for tracker / comment failures.\n\nconst input = $input.first();\nconst err = (input.json && input.json.error) || input.error || {};\nconst orig = ($('Set Tracker Target').first() && $('Set Tracker Target').first().json) || {};\n\nreturn [{\n  json: {\n    ok: false,\n    fallback: true,\n    deliveryId: orig.deliveryId || 'unknown',\n    issueNumber: orig.issueNumber,\n    repoFullName: orig.repoFullName,\n    trackerTarget: orig.trackerTarget || 'unknown',\n    error: {\n      message: err.message || 'unknown error',\n      name: err.name || 'TrackerError',\n    },\n    receivedAt: orig.receivedAt || new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "gh-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: GitHub-Tracker error ' + ($json.error.name || 'Error') + ': ' + ($json.error.message || '') + ' (issue ' + ($json.repoFullName || '?') + '#' + ($json.issueNumber || '?') + ', target ' + ($json.trackerTarget || 'unknown') + ')' }) }}",
+        "options": {}
+      },
+      "id": "gh-err-slack-alert",
+      "name": "Error Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2640, 380],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, message: 'Issue received, downstream sync deferred' }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "gh-err-respond",
+      "name": "Error Respond to GitHub",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2840, 380]
+    }
+  ],
+  "connections": {
+    "GitHub Webhook": { "main": [[{ "node": "Verify Webhook (opt-in)", "type": "main", "index": 0 }]] },
+    "Verify Webhook (opt-in)": { "main": [[{ "node": "Rate Limit (opt-in)", "type": "main", "index": 0 }]] },
+    "Rate Limit (opt-in)": { "main": [[{ "node": "Idempotency Check (opt-in)", "type": "main", "index": 0 }]] },
+    "Idempotency Check (opt-in)": { "main": [[{ "node": "Filter Event Type", "type": "main", "index": 0 }]] },
+    "Filter Event Type": { "main": [[{ "node": "Normalize Payload", "type": "main", "index": 0 }]] },
+    "Normalize Payload": { "main": [[{ "node": "Classify by Labels", "type": "main", "index": 0 }]] },
+    "Classify by Labels": { "main": [[{ "node": "Set Tracker Target", "type": "main", "index": 0 }]] },
+    "Set Tracker Target": { "main": [[{ "node": "Route by Tracker", "type": "main", "index": 0 }]] },
+    "Route by Tracker": {
+      "main": [
+        [{ "node": "Linear Create Issue", "type": "main", "index": 0 }],
+        [{ "node": "Jira Create Issue", "type": "main", "index": 0 }],
+        [{ "node": "ClickUp Create Task", "type": "main", "index": 0 }]
+      ]
+    },
+    "Linear Create Issue": {
+      "main": [
+        [{ "node": "Normalize Tracker Output", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Jira Create Issue": {
+      "main": [
+        [{ "node": "Normalize Tracker Output", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "ClickUp Create Task": {
+      "main": [
+        [{ "node": "Normalize Tracker Output", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normalize Tracker Output": { "main": [[{ "node": "Comment on GitHub Issue", "type": "main", "index": 0 }]] },
+    "Comment on GitHub Issue": {
+      "main": [
+        [{ "node": "Respond to GitHub", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Error Fallback": { "main": [[{ "node": "Error Slack Alert", "type": "main", "index": 0 }]] },
+    "Error Slack Alert": { "main": [[{ "node": "Error Respond to GitHub", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

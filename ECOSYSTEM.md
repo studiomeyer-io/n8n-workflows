@@ -6,7 +6,7 @@
 
 | Project | Description | Install |
 |---------|-------------|---------|
-| **[n8n-workflows](https://github.com/studiomeyer-io/n8n-workflows)** *(this repo)* | Production n8n workflows with hardened patterns. No memory required. CRM router, Stripe, uptime, SSL watcher, Slack digest. | clone + import |
+| **[n8n-workflows](https://github.com/studiomeyer-io/n8n-workflows)** *(this repo)* | Production n8n workflows with hardened patterns. No memory required. 10 templates: CRM router, Stripe, uptime, SSL, Slack digest, Calendly, GitHub issues, RSS, calendar conflicts, CSV validator. | clone + import |
 | **[n8n-templates](https://github.com/studiomeyer-io/n8n-templates)** | Memory-backed n8n workflows. Voice agents, customer support, personal assistants, restaurant bots. Same production patterns, plus StudioMeyer Memory for cross-session context. | clone + import |
 | **[n8n-nodes-studiomeyer-memory](https://github.com/studiomeyer-io/n8n-nodes-studiomeyer-memory)** | Official n8n community node for StudioMeyer Memory. 16 operations across Memory, Entity, Session, Insight resources. | `npm install n8n-nodes-studiomeyer-memory` |
 

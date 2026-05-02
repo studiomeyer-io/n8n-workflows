@@ -1,0 +1,285 @@
+{
+  "name": "Calendar Conflict Detector (Google / Outlook)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Calendar Conflict Detector\n\nSchedule trigger fetches the next N days of events from Google Calendar (default) or Outlook for each calendar in `CALENDAR_IDS`, runs an interval-overlap algorithm across all pairs, and posts a Slack alert per detected conflict.\n\n**Production patterns wired:**\n- Rate limit (opt-in, `RATE_LIMIT_ENABLED=1`, per-calendar)\n- Idempotency on conflict-pair hash (opt-in, `IDEMPOTENCY_ENABLED=1`, 24h window)\n- Error branches with structured fallback per calendar\n\nNo HMAC because the trigger is internal cron.\n\nSee `README.md` for setup, env vars, and extension recipes.",
+        "height": 320,
+        "width": 400,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Set `CALENDAR_PROVIDER=google` (default) or `outlook`.\n2. Set `CALENDAR_IDS` to a comma-separated list of calendar IDs (Google: emails / IDs, Outlook: user UPNs).\n3. Add provider credentials: `googleCalendarOAuth2Api` (scope `calendar.readonly`) OR `microsoftOutlookOAuth2Api` (scope `Calendars.Read`).\n4. Set `SLACK_OPS_WEBHOOK` for conflict alerts.\n5. Set `CONFLICT_LOOKAHEAD_DAYS` to override the 7-day default window.\n6. Self-hosted n8n: set `NODE_FUNCTION_ALLOW_BUILTIN=crypto`.\n7. Adjust schedule (default daily 06:00 UTC).",
+        "height": 320,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 240]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\nThree patterns wired. Two opt-in nodes plus always-on per-calendar error branches.\n\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 fetches / hour / calendar)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (24-hour window on `sha256(eventA.id + eventB.id)`)\n- **Per-calendar error branch:** always on. Each provider fetch has `onError: continueErrorOutput`. One calendar failing does not stop overlap detection on the others.\n\nFor clustered n8n, swap the in-memory dedup for Redis SET NX EX 86400. Snippet in the node's comments.",
+        "height": 320,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cal-cd-1-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read CALENDAR_IDS env (comma-separated). Emit one item per calendar.\n// Plus compute the start / end ISO window for the lookahead period.\n\nconst idsEnv = $env.CALENDAR_IDS || '';\nconst ids = idsEnv.split(',').map(s => s.trim()).filter(Boolean);\nif (ids.length === 0) {\n  throw new Error('CALENDAR_IDS env var is empty.');\n}\n\nconst lookaheadDays = Math.max(1, parseInt($env.CONFLICT_LOOKAHEAD_DAYS || '7', 10));\nconst now = new Date();\nconst end = new Date(now.getTime() + lookaheadDays * 24 * 60 * 60 * 1000);\n\nreturn ids.map(id => ({\n  json: {\n    calendarId: id,\n    timeMinIso: now.toISOString(),\n    timeMaxIso: end.toISOString(),\n  },\n}));"
+      },
+      "id": "cal-cd-2-list",
+      "name": "Read Calendar IDs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-calendar-ID sliding-window rate limit, opt-in.\n// 60 fetches per hour per calendar.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 60 * 60 * 1000;\nconst MAX_KEYS = 200;\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 50);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const id = item.json.calendarId;\n  const hits = buckets[id] || [];\n  if (hits.length >= LIMIT) continue;\n  buckets[id] = [...hits, now];\n  out.push(item);\n}\nreturn out;"
+      },
+      "id": "cal-cd-pp-1-ratelimit",
+      "name": "Rate Limit (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pick provider from env. Default google.\n\nconst provider = ($env.CALENDAR_PROVIDER || 'google').toLowerCase();\nreturn $input.all().map(item => ({ json: { ...item.json, provider } }));"
+      },
+      "id": "cal-cd-3-provider",
+      "name": "Set Provider",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 60]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.provider }}",
+                    "rightValue": "google",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "outputKey": "google"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.provider }}",
+                    "rightValue": "outlook",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "outputKey": "outlook"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cal-cd-4-route",
+      "name": "Route by Provider",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.calendarId) + '/events' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "timeMin", "value": "={{ $json.timeMinIso }}" },
+            { "name": "timeMax", "value": "={{ $json.timeMaxIso }}" },
+            { "name": "singleEvents", "value": "true" },
+            { "name": "orderBy", "value": "startTime" },
+            { "name": "maxResults", "value": "250" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cal-cd-5a-google",
+      "name": "Google Calendar List",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, -100],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://graph.microsoft.com/v1.0/users/' + encodeURIComponent($json.calendarId) + '/calendarView' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "microsoftOutlookOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "startDateTime", "value": "={{ $json.timeMinIso }}" },
+            { "name": "endDateTime", "value": "={{ $json.timeMaxIso }}" },
+            { "name": "$top", "value": "250" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cal-cd-5b-outlook",
+      "name": "Outlook Events List",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, 220],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize provider-specific event shapes into a stable schema.\n// Google: items[].{id,summary,start,end,status,htmlLink}\n// Outlook: value[].{id,subject,start,end,showAs,webLink}\n//\n// Microsoft Graph calendarView default returns dateTime in UTC with `timeZone: 'UTC'`.\n// If the caller sets a `Prefer: outlook.timezone=\"...\"` header (this template does not),\n// the response can come back in a Windows timezone name like 'Eastern Standard Time'.\n// In that case our normalization keeps the value as UTC (with a warning logged) because\n// resolving Windows tz aliases requires a lookup table; false UTC interpretation is\n// safer than V8 parsing the unsuffixed string as local server time.\n\nconst tzAlreadyEncoded = (s) => /(?:Z|[+-]\\d{2}:?\\d{2})$/.test(String(s || ''));\n\nconst toUtcIsoStrict = (dateTime, timeZone) => {\n  if (!dateTime) return null;\n  // If the string already carries an explicit offset suffix, parse as-is\n  if (tzAlreadyEncoded(dateTime)) return new Date(dateTime).toISOString();\n  // Otherwise this is the calendarView default shape: ISO without suffix in UTC\n  if (timeZone && timeZone !== 'UTC') {\n    console.log('[calendar] WARNING: Outlook event has timeZone=' + timeZone + ' but no offset suffix, treating as UTC');\n  }\n  return new Date(dateTime + 'Z').toISOString();\n};\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  const calendarId = (j.calendarId) || (j._calendarId) || ($('Set Provider').first() && $('Set Provider').first().json.calendarId) || 'unknown';\n  const provider = j.provider || ($('Set Provider').first() && $('Set Provider').first().json.provider) || 'google';\n\n  // Google envelope: { items: [...] }, Outlook envelope: { value: [...] }\n  const eventArr = Array.isArray(j.items) ? j.items : (Array.isArray(j.value) ? j.value : []);\n\n  for (const ev of eventArr) {\n    let title = '';\n    let startIso = null;\n    let endIso = null;\n    let url = null;\n    let isAllDay = false;\n    let included = true;\n\n    if (provider === 'google') {\n      if (String(ev.status || '') === 'cancelled') { included = false; }\n      title = ev.summary || '(no title)';\n      url = ev.htmlLink || null;\n      const s = ev.start || {};\n      const e = ev.end || {};\n      isAllDay = !!s.date && !s.dateTime;\n      // Google v3 events.list returns dateTime with offset suffix (`+02:00` or `Z`)\n      startIso = s.dateTime ? new Date(s.dateTime).toISOString() : (s.date ? new Date(s.date + 'T00:00:00Z').toISOString() : null);\n      endIso = e.dateTime ? new Date(e.dateTime).toISOString() : (e.date ? new Date(e.date + 'T23:59:59Z').toISOString() : null);\n    } else {\n      // outlook\n      if (String(ev.showAs || '') === 'free') { included = false; }\n      title = ev.subject || '(no subject)';\n      url = ev.webLink || null;\n      isAllDay = !!ev.isAllDay;\n      const s = ev.start || {};\n      const e = ev.end || {};\n      startIso = toUtcIsoStrict(s.dateTime, s.timeZone);\n      endIso = toUtcIsoStrict(e.dateTime, e.timeZone);\n    }\n\n    if (!included) continue;\n    if (!startIso || !endIso) continue;\n\n    out.push({ json: { calendarId, provider, eventId: ev.id || (calendarId + ':' + startIso), title, url, startIso, endIso, isAllDay } });\n  }\n}\n\nreturn out;"
+      },
+      "id": "cal-cd-6-normalize",
+      "name": "Normalize Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Detect overlapping events across DIFFERENT calendars.\n// Pair-wise scan, only flag when calendarId differs and time ranges intersect.\n\nconst events = $input.all().map(i => i.json);\nconst byCal = {};\nfor (const e of events) {\n  byCal[e.calendarId] = byCal[e.calendarId] || [];\n  byCal[e.calendarId].push(e);\n}\n\nconst toMs = iso => new Date(iso).getTime();\nconst conflicts = [];\nconst calIds = Object.keys(byCal);\n\nfor (let i = 0; i < calIds.length; i++) {\n  for (let j = i + 1; j < calIds.length; j++) {\n    const a = byCal[calIds[i]];\n    const b = byCal[calIds[j]];\n    for (const ea of a) {\n      const aS = toMs(ea.startIso); const aE = toMs(ea.endIso);\n      if (!Number.isFinite(aS) || !Number.isFinite(aE)) continue;\n      for (const eb of b) {\n        const bS = toMs(eb.startIso); const bE = toMs(eb.endIso);\n        if (!Number.isFinite(bS) || !Number.isFinite(bE)) continue;\n        const overlapStart = Math.max(aS, bS);\n        const overlapEnd = Math.min(aE, bE);\n        if (overlapStart < overlapEnd) {\n          conflicts.push({\n            json: {\n              calendarA: ea.calendarId,\n              calendarB: eb.calendarId,\n              eventA: ea,\n              eventB: eb,\n              overlapStartIso: new Date(overlapStart).toISOString(),\n              overlapEndIso: new Date(overlapEnd).toISOString(),\n              overlapMinutes: Math.round((overlapEnd - overlapStart) / 60000),\n            },\n          });\n        }\n      }\n    }\n  }\n}\n\nreturn conflicts;"
+      },
+      "id": "cal-cd-7-overlaps",
+      "name": "Detect Overlaps",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 24-hour idempotency window on conflict-pair hash, opt-in.\n\nconst crypto = require('crypto');\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst WINDOW_MS = 24 * 60 * 60 * 1000;\nconst MAX_KEYS = 20000;\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 2000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  const aId = j.eventA && j.eventA.eventId;\n  const bId = j.eventB && j.eventB.eventId;\n  if (!aId || !bId) { out.push(item); continue; }\n  const sorted = [String(aId), String(bId)].sort().join(':');\n  const dedupKey = crypto.createHash('sha256').update(sorted).digest('hex').slice(0, 32);\n  if (seen[dedupKey]) continue;\n  seen[dedupKey] = now;\n  out.push(item);\n}\nreturn out;\n\n// Redis variant for clustered n8n:\n// const result = await redis.set('cf-idem:' + dedupKey, '1', 'EX', 86400, 'NX');\n// if (result === null) continue;"
+      },
+      "id": "cal-cd-pp-2-idempotency",
+      "name": "Idempotency Filter (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1840, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':collision: Calendar conflict (' + ($json.overlapMinutes || 0) + ' min overlap) between ' + $json.calendarA + ' and ' + $json.calendarB + ' starting ' + $json.overlapStartIso + ' (' + ($json.eventA.title || '') + ' vs ' + ($json.eventB.title || '') + ')' }) }}",
+        "options": {}
+      },
+      "id": "cal-cd-8-slack",
+      "name": "Slack Alert per Conflict",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2040, 60],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback when a calendar fetch fails.\n\nconst input = $input.first();\nconst err = (input.json && input.json.error) || input.error || {};\nconst orig = input.json || {};\n\nreturn [{\n  json: {\n    ok: false,\n    fallback: true,\n    calendarId: orig.calendarId || 'unknown',\n    provider: orig.provider || 'unknown',\n    error: {\n      message: err.message || 'unknown error',\n      name: err.name || 'CalendarFetchError',\n    },\n    receivedAt: new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "cal-cd-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: Calendar fetch error (' + ($json.provider || 'unknown') + ' / ' + ($json.calendarId || 'unknown') + '): ' + ($json.error.message || 'unknown') }) }}",
+        "options": {}
+      },
+      "id": "cal-cd-err-slack-alert",
+      "name": "Error Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 380],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": { "main": [[{ "node": "Read Calendar IDs", "type": "main", "index": 0 }]] },
+    "Read Calendar IDs": { "main": [[{ "node": "Rate Limit (opt-in)", "type": "main", "index": 0 }]] },
+    "Rate Limit (opt-in)": { "main": [[{ "node": "Set Provider", "type": "main", "index": 0 }]] },
+    "Set Provider": { "main": [[{ "node": "Route by Provider", "type": "main", "index": 0 }]] },
+    "Route by Provider": {
+      "main": [
+        [{ "node": "Google Calendar List", "type": "main", "index": 0 }],
+        [{ "node": "Outlook Events List", "type": "main", "index": 0 }]
+      ]
+    },
+    "Google Calendar List": {
+      "main": [
+        [{ "node": "Normalize Events", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Outlook Events List": {
+      "main": [
+        [{ "node": "Normalize Events", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normalize Events": { "main": [[{ "node": "Detect Overlaps", "type": "main", "index": 0 }]] },
+    "Detect Overlaps": { "main": [[{ "node": "Idempotency Filter (opt-in)", "type": "main", "index": 0 }]] },
+    "Idempotency Filter (opt-in)": { "main": [[{ "node": "Slack Alert per Conflict", "type": "main", "index": 0 }]] },
+    "Error Fallback": { "main": [[{ "node": "Error Slack Alert", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

@@ -1,0 +1,368 @@
+{
+  "name": "RSS to Multi-Channel Social (X / LinkedIn / Discord)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## RSS to Multi-Channel Social\n\nSchedule trigger fetches RSS feeds, dedups against a 7-day in-memory window of seen guids, formats per-channel posts (X 280 chars, LinkedIn longer, Discord embed), and posts via the enabled channels in parallel.\n\n**Production patterns wired:**\n- Rate limit (opt-in, `RATE_LIMIT_ENABLED=1`, per-feed-host)\n- Idempotency on `item.guid` (opt-in, `IDEMPOTENCY_ENABLED=1`, 7-day window)\n- Error branches per channel (always on, partial-failure tolerant)\n\nNo HMAC because the trigger is internal cron, not a public webhook.\n\nSee `README.md` for setup, env vars, and extension recipes.",
+        "height": 320,
+        "width": 400,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Set `RSS_FEEDS` to a comma-separated list of feed URLs.\n2. Set `SOCIAL_CHANNELS` to a comma-separated subset of `x,linkedin,discord`.\n3. Add credentials: X OAuth 1.0a (`twitterOAuth1Api`), LinkedIn OAuth 2.0 (`linkedInOAuth2Api`).\n4. Set `DISCORD_WEBHOOK_URL` env var (no credential needed).\n5. Set `SLACK_OPS_WEBHOOK` for the ops summary and error alerts.\n6. Self-hosted n8n: set `NODE_FUNCTION_ALLOW_BUILTIN=crypto`.\n7. Adjust schedule in the Schedule Trigger node (default every 30 min).",
+        "height": 320,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 240]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\nThree patterns wired. Two opt-in nodes plus always-on per-channel error branches.\n\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (12 fetches / hour / feed-host)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (7-day window on `item.guid`)\n- **Per-channel error branches:** always on. Each channel POST has `onError: continueErrorOutput`. One channel failing does not break the others.\n\nFor clustered n8n, swap the in-memory dedup for Redis SET NX EX 604800. Snippet in the node's comments.",
+        "height": 320,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "rss-1-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read RSS_FEEDS env (comma-separated URLs). Emit one item per feed URL\n// so the next HTTP Request fans out.\n\nconst feedsEnv = $env.RSS_FEEDS || '';\nconst feeds = feedsEnv.split(',').map(s => s.trim()).filter(Boolean);\n\nif (feeds.length === 0) {\n  throw new Error('RSS_FEEDS env var is empty. Set it to a comma-separated list of feed URLs.');\n}\n\nreturn feeds.map(url => ({ json: { feedUrl: url } }));"
+      },
+      "id": "rss-2-list-feeds",
+      "name": "List Feeds",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-feed-host sliding-window rate limit, opt-in.\n// 12 fetches per hour per host (i.e. one every 5 min minimum).\n// This blocks an accidentally too-aggressive schedule from hammering a single feed.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst LIMIT = 12;\nconst WINDOW_MS = 60 * 60 * 1000;\nconst MAX_KEYS = 200;\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 50);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  let host = 'unknown';\n  try { host = new URL(item.json.feedUrl).host; } catch (e) { /* keep unknown */ }\n  const hits = buckets[host] || [];\n  if (hits.length >= LIMIT) {\n    // Skip this feed for this cycle. Do not throw because other feeds should keep going.\n    continue;\n  }\n  buckets[host] = [...hits, now];\n  out.push(item);\n}\n\nreturn out;"
+      },
+      "id": "rss-pp-1-ratelimit",
+      "name": "Rate Limit (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 60]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.feedUrl }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "rss-3-fetch",
+      "name": "Fetch RSS Feed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [840, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Lightweight RSS / Atom parser. Extracts items with title / link / guid / pubDate / summary.\n// Avoids a heavyweight XML library by tag-walking; works for typical RSS 2.0 + Atom feeds.\n\nconst out = [];\nfor (const item of $input.all()) {\n  const xml = String(item.json.data || item.json.body || '');\n  const feedUrl = item.json.feedUrl || ($input.first().json.feedUrl) || 'unknown';\n\n  // RSS 2.0: <item>...</item>\n  // Atom: <entry>...</entry>\n  const itemRegex = /<(item|entry)[\\s>][\\s\\S]*?<\\/\\1>/gi;\n  const matches = xml.match(itemRegex) || [];\n\n  for (const block of matches) {\n    const pick = (tag) => {\n      const re = new RegExp('<' + tag + '(?:[^>]*)>([\\\\s\\\\S]*?)<\\\\/' + tag + '>', 'i');\n      const m = block.match(re);\n      return m ? m[1].replace(/<!\\[CDATA\\[|\\]\\]>/g, '').trim() : null;\n    };\n    const linkAttr = (() => {\n      const m = block.match(/<link[^>]*href=\"([^\"]+)\"/i);\n      return m ? m[1] : null;\n    })();\n\n    const title = pick('title') || 'Untitled';\n    const link = pick('link') || linkAttr || null;\n    const guid = pick('guid') || pick('id') || link || (title + ':' + (pick('pubDate') || pick('updated') || ''));\n    const pubDate = pick('pubDate') || pick('updated') || pick('published') || null;\n    const summary = (pick('description') || pick('summary') || pick('content') || '').replace(/<[^>]+>/g, '').trim().slice(0, 500);\n\n    out.push({ json: { feedUrl, title, link, guid, pubDate, summary } });\n  }\n}\n\nreturn out;"
+      },
+      "id": "rss-4-parse",
+      "name": "Parse RSS Items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 7-day idempotency window on item guid, opt-in.\n// Filters items already seen.\n\nconst crypto = require('crypto');\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst WINDOW_MS = 7 * 24 * 60 * 60 * 1000;\nconst MAX_KEYS = 50000;\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 5000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const json = item.json || {};\n  const baseKey = json.guid || json.link || (json.title + ':' + (json.pubDate || ''));\n  const dedupKey = crypto.createHash('sha256').update(String(baseKey)).digest('hex').slice(0, 32);\n  if (seen[dedupKey]) continue;\n  seen[dedupKey] = now;\n  out.push(item);\n}\n\nreturn out;\n\n// Redis variant for clustered n8n:\n// const result = await redis.set('rss-idem:' + dedupKey, '1', 'EX', 604800, 'NX');\n// if (result === null) continue;"
+      },
+      "id": "rss-pp-2-idempotency",
+      "name": "Idempotency Filter (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize each item plus pre-format per-channel post text.\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  const title = j.title || 'Untitled';\n  const link = j.link || '';\n  const summary = j.summary || '';\n\n  const xPost = (title.length > 240 ? title.slice(0, 237) + '...' : title) + (link ? ' ' + link : '');\n  const linkedinPost = title + (summary ? '\\n\\n' + summary : '') + (link ? '\\n\\n' + link : '');\n  const discordPost = (title + '\\n' + (summary ? summary + '\\n' : '') + (link ? link : '')).slice(0, 1900);\n\n  out.push({\n    json: {\n      ...j,\n      xText: xPost,\n      linkedinText: linkedinPost,\n      discordText: discordPost,\n    },\n  });\n}\nreturn out;"
+      },
+      "id": "rss-5-normalize",
+      "name": "Normalize Items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pick enabled social channels from env. Default: empty (post nowhere).\n// User must explicitly opt in by setting SOCIAL_CHANNELS.\n\nconst chEnv = ($env.SOCIAL_CHANNELS || '').toLowerCase();\nconst enabled = chEnv.split(',').map(s => s.trim()).filter(Boolean);\n\nconst out = [];\nfor (const item of $input.all()) {\n  for (const channel of enabled) {\n    out.push({ json: { ...item.json, channel } });\n  }\n}\nreturn out;"
+      },
+      "id": "rss-6-fanout",
+      "name": "Set Channel Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 60]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "x",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "outputKey": "x"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "linkedin",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "outputKey": "linkedin"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "discord",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "outputKey": "discord"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "rss-7-route",
+      "name": "Route by Channel",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1840, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.x.com/2/tweets",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "twitterOAuth1Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.xText }) }}",
+        "options": {}
+      },
+      "id": "rss-8a-x",
+      "name": "X Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2040, -100],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.linkedin.com/v2/ugcPosts",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "linkedInOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Restli-Protocol-Version",
+              "value": "2.0.0"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ author: 'urn:li:person:' + ($env.LINKEDIN_AUTHOR_URN || 'YOUR_PERSON_URN'), lifecycleState: 'PUBLISHED', specificContent: { 'com.linkedin.ugc.ShareContent': { shareCommentary: { text: $json.linkedinText }, shareMediaCategory: 'NONE' } }, visibility: { 'com.linkedin.ugc.MemberNetworkVisibility': 'PUBLIC' } }) }}",
+        "options": {}
+      },
+      "id": "rss-8b-linkedin",
+      "name": "LinkedIn Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2040, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ content: $json.discordText, embeds: [{ title: $json.title, url: $json.link, description: ($json.summary || '').slice(0, 400), color: 1591619 }] }) }}",
+        "options": {}
+      },
+      "id": "rss-8c-discord",
+      "name": "Discord Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2040, 220],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate channel results into a single per-cycle summary.\n// Reads the items emitted by the three social-channel nodes and tallies success / failure.\n\nconst items = $input.all();\nconst totals = { x: 0, linkedin: 0, discord: 0, total: items.length, errors: 0 };\nfor (const it of items) {\n  const ch = (it.json && it.json.channel) || 'unknown';\n  if (totals[ch] != null) totals[ch] += 1;\n}\nreturn [{ json: { ...totals, summarizedAt: new Date().toISOString() } }];"
+      },
+      "id": "rss-9-aggregate",
+      "name": "Aggregate Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':newspaper: RSS cycle posted ' + ($json.total || 0) + ' items (X=' + ($json.x || 0) + ', LinkedIn=' + ($json.linkedin || 0) + ', Discord=' + ($json.discord || 0) + ')' }) }}",
+        "options": {}
+      },
+      "id": "rss-10-summary",
+      "name": "Slack Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 60],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback for any failed channel post (X / LinkedIn / Discord).\n\nconst input = $input.first();\nconst err = (input.json && input.json.error) || input.error || {};\nconst orig = input.json || {};\n\nreturn [{\n  json: {\n    ok: false,\n    fallback: true,\n    channel: orig.channel || 'unknown',\n    title: orig.title || 'unknown',\n    link: orig.link || null,\n    error: {\n      message: err.message || 'unknown error',\n      name: err.name || 'SocialPostError',\n    },\n    receivedAt: new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "rss-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: RSS-Social channel error on ' + ($json.channel || 'unknown') + ': ' + ($json.error.message || '') + ' (item: ' + ($json.title || 'unknown') + ')' }) }}",
+        "options": {}
+      },
+      "id": "rss-err-slack-alert",
+      "name": "Error Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 380],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": { "main": [[{ "node": "List Feeds", "type": "main", "index": 0 }]] },
+    "List Feeds": { "main": [[{ "node": "Rate Limit (opt-in)", "type": "main", "index": 0 }]] },
+    "Rate Limit (opt-in)": { "main": [[{ "node": "Fetch RSS Feed", "type": "main", "index": 0 }]] },
+    "Fetch RSS Feed": {
+      "main": [
+        [{ "node": "Parse RSS Items", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse RSS Items": { "main": [[{ "node": "Idempotency Filter (opt-in)", "type": "main", "index": 0 }]] },
+    "Idempotency Filter (opt-in)": { "main": [[{ "node": "Normalize Items", "type": "main", "index": 0 }]] },
+    "Normalize Items": { "main": [[{ "node": "Set Channel Targets", "type": "main", "index": 0 }]] },
+    "Set Channel Targets": { "main": [[{ "node": "Route by Channel", "type": "main", "index": 0 }]] },
+    "Route by Channel": {
+      "main": [
+        [{ "node": "X Post", "type": "main", "index": 0 }],
+        [{ "node": "LinkedIn Post", "type": "main", "index": 0 }],
+        [{ "node": "Discord Webhook", "type": "main", "index": 0 }]
+      ]
+    },
+    "X Post": {
+      "main": [
+        [{ "node": "Aggregate Results", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "LinkedIn Post": {
+      "main": [
+        [{ "node": "Aggregate Results", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Discord Webhook": {
+      "main": [
+        [{ "node": "Aggregate Results", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Aggregate Results": { "main": [[{ "node": "Slack Summary", "type": "main", "index": 0 }]] },
+    "Error Fallback": { "main": [[{ "node": "Error Slack Alert", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

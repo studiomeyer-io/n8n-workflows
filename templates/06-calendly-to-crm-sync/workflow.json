@@ -1,0 +1,593 @@
+{
+  "name": "Calendly to CRM Sync (Pipedrive / HubSpot / Salesforce)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Calendly to CRM Sync\n\nCalendly v2 webhook lands here, payload is HMAC-verified, normalized, classified by event type, and routed to the configured CRM (Pipedrive default, HubSpot, or Salesforce).\n\n**Production patterns wired:**\n- HMAC verify with Calendly v2 signature format (opt-in, `CALENDLY_SIGNING_SECRET`)\n- Rate limit (opt-in, `RATE_LIMIT_ENABLED=1`)\n- Idempotency on `event.uri` (opt-in, `IDEMPOTENCY_ENABLED=1`)\n- Error branches with structured fallback\n\nSee `README.md` for setup, env vars, and extension recipes.",
+        "height": 320,
+        "width": 400,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Create a Calendly v2 webhook subscription via the Calendly API or the UI. Subscribe to `invitee.created`, `invitee.canceled`, optionally `invitee.no_show`.\n2. Set `CALENDLY_SIGNING_SECRET` to the same `signing_key` you configured in the subscription.\n3. Set `CRM_TARGET=pipedrive` (or `hubspot` or `salesforce`) in your n8n env.\n4. Set CRM stage IDs: `CRM_PIPELINE_BOOKED_ID`, `CRM_PIPELINE_CANCELED_ID`.\n5. Configure Slack webhook URL in `SLACK_OPS_WEBHOOK` for ops notifications.\n6. Self-hosted n8n: set `NODE_FUNCTION_ALLOW_BUILTIN=crypto`.",
+        "height": 320,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 240]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\nFour patterns wired as opt-in nodes. Default-off via env vars so import boots clean.\n\n- **HMAC verify:** `CALENDLY_SIGNING_SECRET` + `WEBHOOK_INTEGRITY_CHECK_ENABLED=1` (Calendly v2 format: `t=<ts>,v1=<hmac>`)\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 req / 5 min / IP)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (5-min window on `event.uri`)\n- **Error branch:** always on. Every HTTP node has `onError: continueErrorOutput` wired to the Error Fallback Code node.\n\nFor clustered n8n, swap the in-memory dedup for Redis SET NX EX 300. Snippet in each opt-in node's comments.",
+        "height": 320,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "calendly-webhook",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "cal-1-trigger",
+      "name": "Calendly Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 60],
+      "webhookId": "calendly-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calendly v2 HMAC signature verification, opt-in.\n// Header: Calendly-Webhook-Signature with format `t=<unix-ts>,v1=<hmac-sha256>`\n// HMAC payload: `<timestamp>.<rawBody>` (Stripe-like, not just rawBody).\n//\n// Enable by setting CALENDLY_SIGNING_SECRET + WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n// Pass-through when unset.\n\nconst secret = $env.CALENDLY_SIGNING_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.rawBody || (typeof item.body === 'string' ? item.body : JSON.stringify(item.body || {}));\nconst headers = item.headers || {};\nconst sigHeader = headers['calendly-webhook-signature'] || headers['Calendly-Webhook-Signature'];\n\nif (!sigHeader || typeof sigHeader !== 'string') {\n  throw new Error('UNAUTHORIZED: missing Calendly-Webhook-Signature header');\n}\n\n// Parse `t=<ts>,v1=<hmac>` into a map\nconst parts = {};\nfor (const segment of sigHeader.split(',')) {\n  const [k, v] = segment.split('=');\n  if (k && v) parts[k.trim()] = v.trim();\n}\nconst ts = parts.t;\nconst v1 = parts.v1;\n\nif (!ts || !v1) {\n  throw new Error('UNAUTHORIZED: malformed Calendly signature header');\n}\n\n// Replay-window check: 5 minutes\nconst tsNum = parseInt(ts, 10);\nif (!Number.isFinite(tsNum)) {\n  throw new Error('UNAUTHORIZED: invalid timestamp');\n}\nconst nowSec = Math.floor(Date.now() / 1000);\nconst REPLAY_WINDOW_S = 5 * 60;\nif (Math.abs(nowSec - tsNum) > REPLAY_WINDOW_S) {\n  throw new Error('UNAUTHORIZED: signature timestamp outside replay window');\n}\n\nconst signedPayload = ts + '.' + rawBody;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');\n\n// Length-guard before constant-time compare\nif (v1.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expBuf = Buffer.from(expected, 'utf8');\nconst v1Buf = Buffer.from(v1, 'utf8');\nif (!crypto.timingSafeEqual(expBuf, v1Buf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
+      },
+      "id": "cal-pp-1-verify",
+      "name": "Verify Webhook (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-IP sliding-window rate limit, opt-in.\n// Enable by setting RATE_LIMIT_ENABLED=1.\n// 60 requests per 5 minutes per IP.\n//\n// $getWorkflowStaticData is per-instance, not cluster-aware. Replace with\n// Redis INCR + EXPIRE for multi-worker n8n. Snippet at the bottom.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst headers = item.headers || {};\nconst rawIp = headers['x-forwarded-for'] || headers['x-real-ip'] || 'unknown';\nconst key = String(rawIp).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];\n\n// Redis variant for clustered n8n:\n// const Redis = require('ioredis');\n// const redis = new Redis(process.env.REDIS_URL);\n// const cnt = await redis.incr('rl:' + key);\n// if (cnt === 1) await redis.expire('rl:' + key, 300);\n// await redis.quit();\n// if (cnt > LIMIT) throw new Error('RATE_LIMIT_EXCEEDED');"
+      },
+      "id": "cal-pp-2-ratelimit",
+      "name": "Rate Limit (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 5-minute idempotency window on Calendly event.uri, opt-in.\n// Enable by setting IDEMPOTENCY_ENABLED=1.\n// Calendly retries on 5xx for up to 24 hours, but a 5-minute window catches\n// the storm of retries that follow a recovery. The longer-tail retries\n// usually arrive after the first successful processing.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 10000;\n\nconst item = $input.first();\nconst body = item.body || {};\n// Calendly v2 payload: { event: 'invitee.created', payload: { event: { uri }, invitee: { uri } } }\nconst eventUri = body.payload && body.payload.event && body.payload.event.uri;\nconst inviteeUri = body.payload && body.payload.invitee && body.payload.invitee.uri;\nconst evtName = body.event || 'unknown';\nconst idempotencyKey = (eventUri && inviteeUri) ? (evtName + ':' + eventUri + ':' + inviteeUri) : null;\n\nif (!idempotencyKey) {\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 1000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[idempotencyKey]) {\n  return [{ json: { skipped: true, reason: 'duplicate', idempotencyKey } }];\n}\nseen[idempotencyKey] = now;\n\nreturn [$input.first()];\n\n// Redis variant:\n// const result = await redis.set('idem:' + idempotencyKey, '1', 'EX', 300, 'NX');\n// if (result === null) return [];"
+      },
+      "id": "cal-pp-3-idempotency",
+      "name": "Idempotency Check (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize Calendly v2 nested webhook payload into a stable schema.\n// Calendly v2 ships everything inside body.payload with `invitee` and `event` sub-objects.\n\nconst body = $input.first().body || {};\nconst eventName = body.event || 'unknown';\nconst payload = body.payload || {};\nconst event = payload.event || {};\nconst invitee = payload.invitee || {};\nconst scheduled = payload.scheduled_event || event;\n\nconst questionAnswers = Array.isArray(invitee.questions_and_answers) ? invitee.questions_and_answers : [];\nconst answersMap = {};\nfor (const qa of questionAnswers) {\n  if (qa && qa.question && qa.answer != null) answersMap[String(qa.question).toLowerCase().trim()] = String(qa.answer).trim();\n}\n\nreturn [{\n  json: {\n    eventName,\n    eventUri: event.uri || scheduled.uri || null,\n    inviteeUri: invitee.uri || null,\n    inviteeEmail: (invitee.email || '').toLowerCase(),\n    inviteeName: invitee.name || invitee.first_name || 'Unknown',\n    inviteeTimezone: invitee.timezone || null,\n    eventTypeName: scheduled.name || event.name || 'Calendly booking',\n    eventStartTime: scheduled.start_time || event.start_time || null,\n    eventEndTime: scheduled.end_time || event.end_time || null,\n    cancelReason: invitee.cancellation && invitee.cancellation.reason ? invitee.cancellation.reason : null,\n    canceler: invitee.cancellation && invitee.cancellation.canceled_by ? invitee.cancellation.canceled_by : null,\n    questionAnswers: answersMap,\n    receivedAt: new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "cal-1-normalize",
+      "name": "Normalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Classify the booking lifecycle and pick a CRM stage.\n// Three states: booked (invitee.created), canceled (invitee.canceled), no_show (invitee.no_show).\n\nconst input = $input.first().json;\nconst evt = String(input.eventName || '').toLowerCase();\n\nlet lifecycle = 'unknown';\nlet stageEnv = 'CRM_PIPELINE_CANCELED_ID';\n\nif (evt === 'invitee.created') {\n  lifecycle = 'booked';\n  stageEnv = 'CRM_PIPELINE_BOOKED_ID';\n} else if (evt === 'invitee.canceled') {\n  lifecycle = 'canceled';\n  stageEnv = 'CRM_PIPELINE_CANCELED_ID';\n} else if (evt === 'invitee.no_show') {\n  lifecycle = 'no_show';\n  stageEnv = 'CRM_PIPELINE_CANCELED_ID';\n}\n\nconst stageId = $env[stageEnv] || '1';\n\nreturn [{\n  json: {\n    ...input,\n    lifecycle,\n    stageId,\n  },\n}];"
+      },
+      "id": "cal-2-classify",
+      "name": "Classify Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pick CRM target from env. Default pipedrive.\n\nconst input = $input.first().json;\nconst crmTarget = ($env.CRM_TARGET || 'pipedrive').toLowerCase();\n\nreturn [{\n  json: {\n    ...input,\n    crmTarget,\n  },\n}];"
+      },
+      "id": "cal-3-set-routing",
+      "name": "Set CRM Target",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 60]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.crmTarget }}",
+                    "rightValue": "pipedrive",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "pipedrive"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.crmTarget }}",
+                    "rightValue": "hubspot",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "hubspot"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.crmTarget }}",
+                    "rightValue": "salesforce",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "salesforce"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "cal-4-route",
+      "name": "Route by CRM",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1640, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.pipedrive.com/v1/deals",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "api_token",
+              "value": "={{ $credentials.pipedriveApi.apiToken }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "title",
+              "value": "={{ $json.eventTypeName }} - {{ $json.inviteeName }} ({{ $json.inviteeEmail }}) [{{ $json.lifecycle }}]"
+            },
+            {
+              "name": "value",
+              "value": "0"
+            },
+            {
+              "name": "currency",
+              "value": "EUR"
+            },
+            {
+              "name": "stage_id",
+              "value": "={{ $json.stageId }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cal-5a-pipedrive",
+      "name": "Pipedrive Upsert Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, -100],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/deals",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.hubspotApi.accessToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: { dealname: $json.eventTypeName + ' - ' + $json.inviteeName + ' (' + $json.inviteeEmail + ') [' + $json.lifecycle + ']', amount: '0', dealstage: $json.stageId } }) }}",
+        "options": {}
+      },
+      "id": "cal-5b-hubspot",
+      "name": "HubSpot Upsert Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-instance.my.salesforce.com/services/data/v60.0/sobjects/Opportunity",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.salesforceApi.accessToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ Name: $json.eventTypeName + ' - ' + $json.inviteeName + ' (' + $json.inviteeEmail + ') [' + $json.lifecycle + ']', StageName: $json.stageId, Amount: 0, CloseDate: ($json.eventStartTime || new Date(Date.now() + 30 * 86400000).toISOString()).slice(0, 10) }) }}",
+        "options": {}
+      },
+      "id": "cal-5c-salesforce",
+      "name": "Salesforce Upsert Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 220],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize CRM response so downstream does not care which CRM fired.\n\nconst input = $input.first();\nconst body = input.json || {};\n\nlet dealId = null;\nif (body.data && body.data.id) dealId = body.data.id;\nelse if (body.id) dealId = body.id;\n\nreturn [{\n  json: {\n    ...body,\n    dealId,\n    crmSuccess: !!dealId,\n  },\n}];"
+      },
+      "id": "cal-6-normalize-crm",
+      "name": "Normalize CRM Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2040, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':calendar: ' + ($('Set CRM Target').first().json.lifecycle || 'unknown').toUpperCase() + ': ' + ($('Set CRM Target').first().json.eventTypeName || 'booking') + ' for ' + ($('Set CRM Target').first().json.inviteeEmail || 'unknown') + ' starting ' + ($('Set CRM Target').first().json.eventStartTime || 'unknown') }) }}",
+        "options": {}
+      },
+      "id": "cal-7-slack",
+      "name": "Slack Ops Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2240, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, lifecycle: $('Set CRM Target').first().json.lifecycle, dealId: $json.dealId }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "cal-8-respond",
+      "name": "Respond to Calendly",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback for downstream API failures (Pipedrive / HubSpot / Salesforce / Slack).\n// Builds a structured error log and a graceful response so Calendly sees a 200\n// instead of triggering a 24-hour retry storm.\n\nconst input = $input.first();\nconst err = (input.json && input.json.error) || input.error || {};\nconst orig = ($('Set CRM Target').first() && $('Set CRM Target').first().json) || {};\n\nreturn [{\n  json: {\n    ok: false,\n    fallback: true,\n    eventUri: orig.eventUri || 'unknown',\n    inviteeEmail: orig.inviteeEmail || 'unknown',\n    crmTarget: orig.crmTarget || 'unknown',\n    lifecycle: orig.lifecycle || 'unknown',\n    error: {\n      message: err.message || 'unknown error',\n      name: err.name || 'CalendlyCrmError',\n    },\n    receivedAt: orig.receivedAt || new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "cal-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: Calendly-CRM error ' + ($json.error.name || 'Error') + ': ' + ($json.error.message || '') + ' (event ' + ($json.eventUri || 'unknown') + ', target ' + ($json.crmTarget || 'unknown') + ')' }) }}",
+        "options": {}
+      },
+      "id": "cal-err-slack-alert",
+      "name": "Error Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 380],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, message: 'Booking received, downstream sync deferred' }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "cal-err-respond",
+      "name": "Error Respond to Calendly",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2640, 380]
+    }
+  ],
+  "connections": {
+    "Calendly Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Webhook (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Webhook (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Rate Limit (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate Limit (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Payload": {
+      "main": [
+        [
+          {
+            "node": "Classify Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Event": {
+      "main": [
+        [
+          {
+            "node": "Set CRM Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set CRM Target": {
+      "main": [
+        [
+          {
+            "node": "Route by CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by CRM": {
+      "main": [
+        [
+          {
+            "node": "Pipedrive Upsert Deal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HubSpot Upsert Deal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Salesforce Upsert Deal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipedrive Upsert Deal": {
+      "main": [
+        [
+          {
+            "node": "Normalize CRM Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Upsert Deal": {
+      "main": [
+        [
+          {
+            "node": "Normalize CRM Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Salesforce Upsert Deal": {
+      "main": [
+        [
+          {
+            "node": "Normalize CRM Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize CRM Output": {
+      "main": [
+        [
+          {
+            "node": "Slack Ops Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Ops Notification": {
+      "main": [
+        [
+          {
+            "node": "Respond to Calendly",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Fallback": {
+      "main": [
+        [
+          {
+            "node": "Error Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Error Respond to Calendly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
