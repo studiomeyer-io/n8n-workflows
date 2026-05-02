@@ -1,0 +1,351 @@
+{
+  "name": "Telegram Translator Bot",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Telegram Translator Bot\n\nTelegram trigger receives a message, the workflow detects source language, translates to `TARGET_LANG` via OpenAI default or Anthropic optional, then replies in the same chat.\n\n**Production patterns wired:**\n- Telegram secret_token verification (built-in via the Telegram Trigger node, opt-in via `TELEGRAM_WEBHOOK_SECRET`)\n- Rate limit per Telegram user_id (defense for the LLM call)\n- Idempotency on `update_id` (Telegram retries on 5xx)\n- Multi-provider Switch (OpenAI default, Anthropic optional)\n- LLM Fallback Reply with `isLlmError` discriminator\n- Error branch with structured fallback\n\nSee `README.md` for setup, env vars, and extension recipes.",
+        "height": 360,
+        "width": 400,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Talk to @BotFather on Telegram, create a bot, copy the token.\n2. Add a Telegram credential in n8n with that token. Wire it into the trigger + send-message nodes.\n3. After the workflow is activated, set the Telegram webhook secret_token via curl: `curl 'https://api.telegram.org/bot<TOKEN>/setWebhook?url=<n8n-webhook-url>&secret_token=<random>'`. Set the same value as `TELEGRAM_WEBHOOK_SECRET` env in n8n.\n4. Set `TARGET_LANG` to a BCP-47 code or English language name. Examples: `en`, `de`, `es`, `English`, `Deutsch`. Default `English`.\n5. Set provider env: `LLM_PROVIDER=openai` (default) or `anthropic`.\n6. Add the matching provider credential (`OpenAI API` or `Anthropic API`).\n7. Set `RATE_LIMIT_ENABLED=1`, `IDEMPOTENCY_ENABLED=1` for production.\n8. Self-hosted n8n: set `NODE_FUNCTION_ALLOW_BUILTIN=crypto`.",
+        "height": 380,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 280]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\nFour patterns wired. Telegram webhooks are public, treat them like any signed inbound.\n\n- **Telegram secret_token:** the Trigger node already validates the `X-Telegram-Bot-Api-Secret-Token` header. Set the same value via `setWebhook?secret_token=`.\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 messages / 5 min / user-id, defense for LLM cost)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (5-min window on `update_id`)\n- **Multi-provider Switch:** OpenAI default, Anthropic optional. Both branches converge in `Normalize LLM Output`.\n- **LLM Fallback Reply:** when the LLM throws, send a graceful TTS-friendly fallback (no system-prompt leak via `isLlmError` discriminator).\n- **Error branch:** always on. The `Telegram Reply` error pin fans out to BOTH the user-facing `LLM Fallback Reply` (so the user still gets a response via `Telegram Fallback Reply`) AND the ops-facing `Error Fallback` -> `Slack Alert` (so ops gets an alert via `SLACK_OPS_WEBHOOK`).\n\nFor clustered n8n, swap the in-memory dedup for Redis SET NX EX 300. Snippet in the node's comments.",
+        "height": 380,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -300]
+    },
+    {
+      "parameters": {
+        "updates": ["message"],
+        "additionalFields": {}
+      },
+      "id": "tg-1-trigger",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 60],
+      "webhookId": "telegram-translator-trigger",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter out non-text updates (stickers, photos, voice, etc) and bot self-messages.\n// We only handle text messages for translation.\n\nconst item = $input.first();\nconst body = item.json || {};\nconst msg = body.message || {};\nconst text = msg.text || '';\nconst from = msg.from || {};\nconst chat = msg.chat || {};\nconst updateId = body.update_id;\n\nif (!text || typeof text !== 'string' || text.trim().length === 0) {\n  return [{ json: { skipped: true, reason: 'no-text-content', updateId } }];\n}\nif (from.is_bot) {\n  return [{ json: { skipped: true, reason: 'sender-is-bot', updateId } }];\n}\n// Skip bot commands like /start /help by default.\nif (text.startsWith('/')) {\n  return [{ json: { skipped: true, reason: 'bot-command', updateId } }];\n}\n\nreturn [{ json: {\n  updateId,\n  userId: from.id != null ? String(from.id) : 'unknown',\n  chatId: chat.id != null ? String(chat.id) : null,\n  userLabel: from.username ? '@' + from.username : (from.first_name || 'user-' + from.id),\n  text,\n  raw: body,\n}}];"
+      },
+      "id": "tg-2-filter",
+      "name": "Filter Text Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-user-id sliding-window rate limit, opt-in. Default 60 / 5 min / user.\n// Skipped items pass through without consuming a token.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (j.skipped) { out.push(item); continue; }\n  const key = 'user:' + j.userId;\n  const hits = buckets[key] || [];\n  if (hits.length >= LIMIT) {\n    out.push({ json: { ...j, skipped: true, reason: 'rate-limit', limit: LIMIT } });\n    continue;\n  }\n  buckets[key] = [...hits, now];\n  out.push(item);\n}\nreturn out;"
+      },
+      "id": "tg-pp-1-ratelimit",
+      "name": "Rate Limit (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 5-minute idempotency window on Telegram update_id, opt-in.\n// Telegram retries on 5xx so dedup is important.\n\nconst crypto = require('crypto');\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst data = $getWorkflowStaticData('global');\ndata.seenUpdates = data.seenUpdates || {};\nconst seen = data.seenUpdates;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 500);\n  for (const [k] of oldest) delete seen[k];\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (j.skipped) { out.push(item); continue; }\n  const updateId = j.updateId;\n  if (updateId == null) { out.push(item); continue; }\n  const key = String(updateId);\n  if (seen[key]) {\n    out.push({ json: { ...j, skipped: true, reason: 'duplicate-update-id', dedupKey: key } });\n    continue;\n  }\n  seen[key] = now;\n  out.push(item);\n}\nreturn out;\n\n// Redis variant for clustered n8n:\n// const result = await redis.set('tg-idem:' + updateId, '1', 'EX', 300, 'NX');\n// if (result === null) skip;"
+      },
+      "id": "tg-pp-2-idempotency",
+      "name": "Idempotency Check (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the LLM prompt and select the provider. Default openai.\n\nconst targetLang = $env.TARGET_LANG || 'English';\nconst provider = ($env.LLM_PROVIDER || 'openai').toLowerCase();\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (j.skipped) { out.push(item); continue; }\n  const userText = String(j.text || '').slice(0, 3000); // hard cap to keep tokens bounded\n  const systemPrompt = 'You are a translation engine. Detect the source language of the user message, then translate to ' + targetLang + '. Output ONLY the translated text, no preamble, no quotes, no language label. Preserve emojis and basic punctuation. Keep code blocks unchanged. If the source is already ' + targetLang + ', return the original text verbatim.';\n  out.push({ json: { ...j, provider, systemPrompt, userText } });\n}\nreturn out;"
+      },
+      "id": "tg-3-set-provider",
+      "name": "Set Provider",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "rule-skipped",
+                    "leftValue": "={{ $json.skipped }}",
+                    "rightValue": true,
+                    "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "skipped"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "rule-openai",
+                    "leftValue": "={{ $json.provider }}",
+                    "rightValue": "openai",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "openai"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "rule-anthropic",
+                    "leftValue": "={{ $json.provider }}",
+                    "rightValue": "anthropic",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "anthropic"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "tg-4-route",
+      "name": "Route by Provider",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'gpt-5.4-mini', messages: [{ role: 'system', content: $json.systemPrompt }, { role: 'user', content: $json.userText }], temperature: 0.1, max_tokens: 1000 }) }}",
+        "options": {}
+      },
+      "id": "tg-5-openai",
+      "name": "OpenAI Translate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, -60],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_ME",
+          "name": "OpenAI credentials"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 1000, system: $json.systemPrompt, messages: [{ role: 'user', content: $json.userText }] }) }}",
+        "options": {}
+      },
+      "id": "tg-6-anthropic",
+      "name": "Anthropic Translate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, 180],
+      "credentials": {
+        "anthropicApi": {
+          "id": "REPLACE_ME",
+          "name": "Anthropic credentials"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize OpenAI vs Anthropic response shape into one stable schema.\n// OpenAI: choices[0].message.content\n// Anthropic: content[0].text\n\nconst items = $input.all();\nconst out = [];\nfor (const item of items) {\n  const j = item.json || {};\n  if (j.skipped) { out.push(item); continue; }\n\n  let reply = '';\n  if (j.choices && Array.isArray(j.choices) && j.choices.length > 0) {\n    reply = (j.choices[0].message && j.choices[0].message.content) || '';\n  } else if (j.content && Array.isArray(j.content) && j.content.length > 0) {\n    reply = j.content[0].text || '';\n  } else if (j.translatedText) {\n    reply = j.translatedText;\n  }\n\n  if (!reply || typeof reply !== 'string') {\n    out.push({ json: { ...j, skipped: true, reason: 'empty-llm-response' } });\n    continue;\n  }\n\n  // Pull through chat metadata from the upstream Set Provider node.\n  // Item could be either upstream OpenAI OR Anthropic, both paths set $json before LLM.\n  // The merge for chat metadata happens via the $('Set Provider') call which preserves\n  // the original userId / chatId regardless of which branch ran.\n  let chatId, userId, userLabel;\n  try {\n    const setProvider = $('Set Provider').first();\n    if (setProvider && setProvider.json) {\n      chatId = setProvider.json.chatId;\n      userId = setProvider.json.userId;\n      userLabel = setProvider.json.userLabel;\n    }\n  } catch (e) { /* fallback empty */ }\n\n  out.push({ json: {\n    skipped: false,\n    chatId: chatId || j.chatId || null,\n    userId: userId || j.userId || null,\n    userLabel: userLabel || j.userLabel || null,\n    replyText: reply.trim(),\n  }});\n}\nreturn out;"
+      },
+      "id": "tg-7-normalize-llm",
+      "name": "Normalize LLM Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $credentials.telegramApi.accessToken }}/sendMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "telegramApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.chatId, text: $json.replyText, disable_notification: false }) }}",
+        "options": {}
+      },
+      "id": "tg-8-reply",
+      "name": "Telegram Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 60],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram credentials"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// LLM Fallback Reply.\n// Discriminate between LLM error (provider returned an error envelope) and\n// router error (typo in LLM_PROVIDER -> Switch fallback path).\n// Critical: do NOT JSON.stringify(errorRaw) blindly, because that can leak\n// the full systemPrompt + userText into a structured log.\n\nconst input = $input.first();\nconst raw = input.json || {};\nconst errorRaw = raw.error || raw;\nconst isLlmError = !!(errorRaw && (errorRaw.message || errorRaw.code || (errorRaw.error && errorRaw.error.message)));\nlet errorMessage;\nif (isLlmError) {\n  errorMessage = (errorRaw.message) || (errorRaw.error && errorRaw.error.message) || ('LLM error code ' + (errorRaw.code || '?'));\n} else {\n  // Router fallback (provider unknown). Log without stringifying the prompt.\n  errorMessage = 'Unknown provider value: \"' + (raw.provider || 'undefined') + '\". Set LLM_PROVIDER to openai or anthropic.';\n}\n\n// Pull chat-id from the Set Provider node which we know ran for non-skipped items.\nlet chatId = null, userId = null, userLabel = null;\ntry {\n  const setProvider = $('Set Provider').first();\n  if (setProvider && setProvider.json) {\n    chatId = setProvider.json.chatId;\n    userId = setProvider.json.userId;\n    userLabel = setProvider.json.userLabel;\n  }\n} catch (e) { /* fallback empty */ }\n\nconst fallbackText = 'Sorry, the translator is having trouble right now. Please try again in a few seconds.';\n\nreturn [{ json: {\n  chatId,\n  userId,\n  userLabel,\n  replyText: fallbackText,\n  llmError: { message: errorMessage, isLlmError },\n  at: new Date().toISOString(),\n}}];"
+      },
+      "id": "tg-llm-fallback",
+      "name": "LLM Fallback Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $credentials.telegramApi.accessToken }}/sendMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "telegramApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.chatId, text: $json.replyText }) }}",
+        "options": {}
+      },
+      "id": "tg-llm-fallback-reply",
+      "name": "Telegram Fallback Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 380],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram credentials"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Error Fallback for the Telegram Reply send-failure path.\n// Build a structured ops log so the LLM Fallback Reply path stays user-facing\n// while ops gets a Slack alert about the underlying delivery failure.\n\nconst input = $input.first();\nconst raw = input.json || {};\nconst errorRaw = raw.error || raw;\nconst isHttpError = !!(errorRaw && (errorRaw.message || errorRaw.code));\nconst errorMessage = isHttpError ? (errorRaw.message || 'Telegram send error') : 'Unknown reply-send error';\n\n// Pull chat metadata for the alert body. Fall back gracefully if missing.\nlet chatId = null, userId = null, userLabel = null;\ntry {\n  const setProvider = $('Set Provider').first();\n  if (setProvider && setProvider.json) {\n    chatId = setProvider.json.chatId;\n    userId = setProvider.json.userId;\n    userLabel = setProvider.json.userLabel;\n  }\n} catch (e) { /* ignore */ }\n\nreturn [{ json: {\n  telegramReplyError: { message: errorMessage, raw: errorRaw },\n  chat: { chatId, userId, userLabel },\n  at: new Date().toISOString(),\n}}];"
+      },
+      "id": "tg-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2040, 540]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: Telegram reply-send failed for ' + ($json.chat.userLabel || '?') + ' (chat ' + ($json.chat.chatId || '?') + '): ' + ($json.telegramReplyError.message || 'unknown error') }) }}",
+        "options": {}
+      },
+      "id": "tg-err-slack",
+      "name": "Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2240, 540],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": { "main": [[{ "node": "Filter Text Messages", "type": "main", "index": 0 }]] },
+    "Filter Text Messages": { "main": [[{ "node": "Rate Limit (opt-in)", "type": "main", "index": 0 }]] },
+    "Rate Limit (opt-in)": { "main": [[{ "node": "Idempotency Check (opt-in)", "type": "main", "index": 0 }]] },
+    "Idempotency Check (opt-in)": { "main": [[{ "node": "Set Provider", "type": "main", "index": 0 }]] },
+    "Set Provider": { "main": [[{ "node": "Route by Provider", "type": "main", "index": 0 }]] },
+    "Route by Provider": {
+      "main": [
+        [],
+        [{ "node": "OpenAI Translate", "type": "main", "index": 0 }],
+        [{ "node": "Anthropic Translate", "type": "main", "index": 0 }],
+        [{ "node": "LLM Fallback Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "OpenAI Translate": {
+      "main": [
+        [{ "node": "Normalize LLM Output", "type": "main", "index": 0 }],
+        [{ "node": "LLM Fallback Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Anthropic Translate": {
+      "main": [
+        [{ "node": "Normalize LLM Output", "type": "main", "index": 0 }],
+        [{ "node": "LLM Fallback Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normalize LLM Output": { "main": [[{ "node": "Telegram Reply", "type": "main", "index": 0 }]] },
+    "Telegram Reply": {
+      "main": [
+        [],
+        [
+          { "node": "LLM Fallback Reply", "type": "main", "index": 0 },
+          { "node": "Error Fallback", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "LLM Fallback Reply": { "main": [[{ "node": "Telegram Fallback Reply", "type": "main", "index": 0 }]] },
+    "Error Fallback": { "main": [[{ "node": "Slack Alert", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

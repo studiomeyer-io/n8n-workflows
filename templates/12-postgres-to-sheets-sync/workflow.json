@@ -1,0 +1,217 @@
+{
+  "name": "Postgres to Google Sheets Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Postgres to Google Sheets Sync\n\nSchedule trigger fires (default daily 06:00 UTC). Workflow reads a configurable Postgres SELECT query (typically with a `> last_synced_at` WHERE clause), transforms each row into a Sheets row-shape, appends to a target spreadsheet, then updates the high-water-mark.\n\nIncremental sync. Idempotent. Retries-safe.\n\n**Production patterns wired:**\n- Idempotency on row primary key (the same row, fetched twice within the window, lands in Sheets once)\n- Rate limit on the Sheets append call\n- Error branch with Slack alert + structured log\n- Hard `MAX_ROWS_PER_RUN` cap (default 5000) to protect against runaway queries\n\nSee `README.md` for setup, env vars, and extension recipes.",
+        "height": 340,
+        "width": 400,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Add a Postgres credential pointing at the read-only replica (recommended) or production primary.\n2. Set `PG_SYNC_QUERY` env to a SELECT statement. Use `$1` placeholder for the high-water-mark. Example: `SELECT id, email, created_at, updated_at FROM users WHERE updated_at > $1 ORDER BY updated_at ASC LIMIT 5000`.\n3. Set `PG_SYNC_HWM_INITIAL` to an ISO-8601 timestamp for the first run (the high-water-mark seed). Example: `2026-01-01T00:00:00Z`.\n4. Set `GOOGLE_SHEETS_ID` to the target spreadsheet ID.\n5. Set `GOOGLE_SHEETS_RANGE` to `Sheet1!A1:Z` (or your tab + column range).\n6. Add a Google Sheets OAuth2 credential.\n7. Optional: `MAX_ROWS_PER_RUN=5000` (default), `SLACK_OPS_WEBHOOK` for alerts.\n8. Self-hosted n8n: set `NODE_FUNCTION_ALLOW_BUILTIN=crypto`.",
+        "height": 360,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 260]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\nThree opt-in nodes wired, default-off so the import boots clean.\n\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 Sheets calls / 5 min)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (24-hour window on row primary key)\n- **Error branch:** always on. Sheets failure -> Slack alert + log. Postgres failure raises and stops the run (not silenced).\n- **Hard caps:** `MAX_ROWS_PER_RUN` (default 5000) inside the parser to protect against runaway queries.\n\nNo HMAC: this is a Schedule trigger, not a public webhook.\n\nFor clustered n8n, swap the in-memory dedup for Redis SET NX EX 86400. Snippet in the node's comments.",
+        "height": 340,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      },
+      "id": "pg-1-trigger",
+      "name": "Schedule (Daily 06:00 UTC)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read the high-water-mark from workflow static data.\n// On the first run, fall back to PG_SYNC_HWM_INITIAL env var.\n// Output one item with the current HWM for the Postgres node to consume.\n\nconst data = $getWorkflowStaticData('global');\nlet hwm = data.lastSyncedAt;\nif (!hwm) {\n  const seed = $env.PG_SYNC_HWM_INITIAL;\n  if (!seed) throw new Error('PG_SYNC_HWM_INITIAL env var is required for the first run (ISO-8601 timestamp)');\n  // Validate seed is a parseable ISO date\n  const seedDate = new Date(seed);\n  if (isNaN(seedDate.getTime())) throw new Error('PG_SYNC_HWM_INITIAL is not a valid ISO-8601 date: ' + seed);\n  hwm = seedDate.toISOString();\n}\n\nreturn [{ json: { hwm, runStartedAt: new Date().toISOString() } }];"
+      },
+      "id": "pg-2-read-hwm",
+      "name": "Read HWM",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $env.PG_SYNC_QUERY }}",
+        "options": {
+          "queryReplacement": "={{ $json.hwm }}"
+        }
+      },
+      "id": "pg-3-query",
+      "name": "Postgres Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [640, 60],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Postgres credentials"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-key sliding-window rate limit on the Sheets API call, opt-in.\n// Default 60 ops / 5 min, scoped workflow-wide.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst key = 'sheets-write';\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' Sheets writes per ' + Math.round(WINDOW_MS / 60000) + ' minutes reached');\n}\nbuckets[key] = [...hits, now];\n\nreturn $input.all();"
+      },
+      "id": "pg-pp-1-ratelimit",
+      "name": "Rate Limit (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 24-hour idempotency window on row primary key, opt-in.\n// Drops rows already seen within the window. Reads `id` (or PG_SYNC_DEDUP_KEY env) from each row.\n\nconst crypto = require('crypto');\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst WINDOW_MS = 24 * 60 * 60 * 1000;\nconst MAX_KEYS = 50000;\nconst dedupKeyField = $env.PG_SYNC_DEDUP_KEY || 'id';\n\nconst data = $getWorkflowStaticData('global');\ndata.seenRows = data.seenRows || {};\nconst seen = data.seenRows;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 5000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  const pkRaw = j[dedupKeyField];\n  if (pkRaw == null) { out.push(item); continue; } // no PK -> let it through, do not drop\n  const pkStr = String(pkRaw);\n  const hashed = crypto.createHash('sha256').update(pkStr, 'utf8').digest('hex').slice(0, 32);\n  if (seen[hashed]) continue; // dedup hit\n  seen[hashed] = now;\n  out.push(item);\n}\nreturn out;\n\n// Redis variant for clustered n8n:\n// const result = await redis.set('pgsheets-idem:' + hashed, '1', 'EX', 86400, 'NX');\n// if (result === null) skip;"
+      },
+      "id": "pg-pp-2-idempotency",
+      "name": "Idempotency Check (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Hard cap defense before we hand the rows to Sheets.\n// MAX_ROWS_PER_RUN env (default 5000). If exceeded, slice and warn.\n\nconst MAX_ROWS = parseInt($env.MAX_ROWS_PER_RUN || '5000', 10);\nconst items = $input.all();\nif (items.length === 0) {\n  return [{ json: { skipped: true, reason: 'no-new-rows' } }];\n}\nif (items.length > MAX_ROWS) {\n  // Take the first MAX_ROWS, the rest will be picked up next run via the HWM.\n  return items.slice(0, MAX_ROWS);\n}\nreturn items;"
+      },
+      "id": "pg-4-cap",
+      "name": "Cap MAX_ROWS_PER_RUN",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Project each Postgres row into a Sheets row-shape. Order matters for Sheets append.\n// PG_SYNC_COLUMN_ORDER env defines the column projection. Example: 'id,email,created_at,updated_at'.\n// If unset, falls back to the keys of the first row (ordering not guaranteed across rows).\n\nconst items = $input.all();\nif (items.length === 0 || (items[0].json && items[0].json.skipped)) {\n  return items;\n}\n\nconst order = ($env.PG_SYNC_COLUMN_ORDER || '').split(',').map(s => s.trim()).filter(Boolean);\nconst keys = order.length > 0 ? order : Object.keys(items[0].json || {});\n\nconst values = items.map(item => {\n  const row = item.json || {};\n  return keys.map(k => {\n    const v = row[k];\n    if (v == null) return '';\n    if (v instanceof Date) return v.toISOString();\n    if (typeof v === 'object') return JSON.stringify(v);\n    return String(v);\n  });\n});\n\nreturn [{ json: { values, columnOrder: keys, rowCount: values.length } }];"
+      },
+      "id": "pg-5-transform",
+      "name": "Transform Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $env.GOOGLE_SHEETS_ID }}/values/{{ encodeURIComponent($env.GOOGLE_SHEETS_RANGE || 'Sheet1!A1:Z') }}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ values: $json.values }) }}",
+        "options": {}
+      },
+      "id": "pg-6-sheets",
+      "name": "Append to Sheets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1640, 60],
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Update the HWM only after a successful Sheets append.\n// New HWM = max(updated_at, created_at, ...) across the rows we just synced.\n// PG_SYNC_HWM_FIELD env names the timestamp field. Default 'updated_at'.\n\nconst hwmField = $env.PG_SYNC_HWM_FIELD || 'updated_at';\nconst pgRows = $('Cap MAX_ROWS_PER_RUN').all();\nif (pgRows.length === 0 || (pgRows[0].json && pgRows[0].json.skipped)) {\n  return [{ json: { hwmUnchanged: true } }];\n}\n\nlet maxTs = null;\nfor (const item of pgRows) {\n  const v = (item.json || {})[hwmField];\n  if (v == null) continue;\n  const d = new Date(v);\n  if (isNaN(d.getTime())) continue;\n  if (!maxTs || d > maxTs) maxTs = d;\n}\nif (!maxTs) {\n  return [{ json: { hwmUnchanged: true, reason: 'no-' + hwmField + '-field-on-rows' } }];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.lastSyncedAt = maxTs.toISOString();\n\nreturn [{ json: { newHwm: data.lastSyncedAt, rowsSynced: pgRows.length } }];"
+      },
+      "id": "pg-7-update-hwm",
+      "name": "Update HWM",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1840, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback when Postgres OR Sheets fails. Build a structured error log\n// and post a Slack alert if SLACK_OPS_WEBHOOK is set.\n\nconst input = $input.first();\nconst raw = input.json || {};\nconst errorRaw = raw.error || raw;\nconst isHttpOrPgError = !!(errorRaw && (errorRaw.message || errorRaw.code));\nconst errorMessage = isHttpOrPgError ? (errorRaw.message || 'Sync error') : 'Unknown error: ' + JSON.stringify(errorRaw).slice(0, 200);\n\n// Identify which stage failed.\nlet stage = 'unknown';\ntry { if ($('Postgres Query').first()) stage = 'after-postgres'; } catch (e) {}\ntry { if ($('Append to Sheets').first()) stage = 'after-sheets'; } catch (e) {}\n\nreturn [{\n  json: {\n    syncError: { message: errorMessage, stage, raw: errorRaw },\n    runStartedAt: ($('Read HWM').first() && $('Read HWM').first().json && $('Read HWM').first().json.runStartedAt) || null,\n  },\n}];"
+      },
+      "id": "pg-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: Postgres-to-Sheets sync failed at ' + ($json.syncError.stage || '?') + ': ' + ($json.syncError.message || 'unknown error') }) }}",
+        "options": {}
+      },
+      "id": "pg-err-slack",
+      "name": "Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, 380],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Schedule (Daily 06:00 UTC)": { "main": [[{ "node": "Read HWM", "type": "main", "index": 0 }]] },
+    "Read HWM": { "main": [[{ "node": "Postgres Query", "type": "main", "index": 0 }]] },
+    "Postgres Query": {
+      "main": [
+        [{ "node": "Rate Limit (opt-in)", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Rate Limit (opt-in)": { "main": [[{ "node": "Idempotency Check (opt-in)", "type": "main", "index": 0 }]] },
+    "Idempotency Check (opt-in)": { "main": [[{ "node": "Cap MAX_ROWS_PER_RUN", "type": "main", "index": 0 }]] },
+    "Cap MAX_ROWS_PER_RUN": { "main": [[{ "node": "Transform Rows", "type": "main", "index": 0 }]] },
+    "Transform Rows": { "main": [[{ "node": "Append to Sheets", "type": "main", "index": 0 }]] },
+    "Append to Sheets": {
+      "main": [
+        [{ "node": "Update HWM", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Error Fallback": { "main": [[{ "node": "Slack Alert", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

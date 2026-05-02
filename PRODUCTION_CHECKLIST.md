@@ -22,17 +22,45 @@ The four production patterns ship as opt-in nodes gated by env vars. The default
 | `CRM_PIPELINE_HOT_ID` | string | T01 CRM | Stage ID in your CRM for hot leads. |
 | `CRM_PIPELINE_WARM_ID` | string | T01 CRM | Stage ID for warm leads. |
 | `CRM_PIPELINE_COLD_ID` | string | T01 CRM | Stage ID for cold leads. |
+| `NOTION_API_TOKEN` | string (Notion `secret_*` token) | T11, T15 | Internal Integration Token from notion.so/my-integrations. |
+| `NOTION_DATABASE_ID` | string (32-char UUID) | T11, T15 | Target database ID. Database must be shared with the integration. |
+| `EMAIL_FROM_WHITELIST` | comma-separated domains | T11 | Optional. Only mails from these domains are processed. |
+| `EMAIL_SUBJECT_INCLUDE` | comma-separated keywords | T11 | Optional. Only mails whose subject contains any of these. |
+| `PG_SYNC_QUERY` | string (SELECT with `$1` placeholder) | T12 | The SELECT statement that drives the sync. Always include `LIMIT`. |
+| `PG_SYNC_HWM_INITIAL` | string (ISO-8601) | T12 | First-run high-water-mark seed. After first run, workflow state takes over. |
+| `PG_SYNC_HWM_FIELD` | string | T12 | The timestamp column name. Default `updated_at`. |
+| `PG_SYNC_DEDUP_KEY` | string | T12 | The row primary key column. Default `id`. |
+| `PG_SYNC_COLUMN_ORDER` | comma-separated column names | T12 | The Sheets column projection order. |
+| `GOOGLE_SHEETS_ID` | string | T12 | Target spreadsheet ID. |
+| `GOOGLE_SHEETS_RANGE` | string | T12 | Tab + range. Example: `Sheet1!A1:Z`. |
+| `MAX_ROWS_PER_RUN` | integer | T12 | Default 5000. Defends against runaway queries. |
+| `AUDIT_SIGNING_SECRET` | string (32+ char hex/base64) | T13 | HMAC-SHA256 signing secret for the audit ingest endpoint. |
+| `AUDIT_REPLAY_WINDOW_S` | integer (seconds) | T13 | Default 300. Replay window for signed audit events. |
+| `AUDIT_RATE_LIMIT_PER_IP` | integer | T13 | Default 60. Max requests per IP in the 5-min sliding window. |
+| `MAX_BODY_BYTES` | integer | T13 | Default 1048576 (1MB). Hard cap on the audit-event body size. |
+| `SLACK_SECURITY_WEBHOOK` | URL | T13 | Slack webhook for auth + capacity + database security alerts. |
+| `TELEGRAM_WEBHOOK_SECRET` | string | T14 | Same value used in `setWebhook?secret_token=`. Validated by the trigger node. |
+| `TARGET_LANG` | string (BCP-47 or English name) | T14 | Translation target language. Default `English`. |
+| `LLM_PROVIDER` | `openai` or `anthropic` | T14, T15 (when summary on) | Selects the LLM branch in the multi-provider Switch. |
+| `YOUTUBE_CHANNEL_IDS` | comma-separated `UC...` IDs | T15 | The list of channels to watch. Cap 50. |
+| `LLM_SUMMARY_ENABLED` | `1` to enable | T15 | Optional. When set, each new video gets an LLM summary in the Notion row. |
+| `MAX_VIDEOS_PER_CHANNEL_PER_RUN` | integer | T15 | Default 10. First-run defense for high-volume channels. |
+| `SLACK_OPS_WEBHOOK` | URL | T11, T12, T15 | Slack webhook for non-security ops alerts (Notion failure, Sheets append failure, RSS fetch failure). |
 
 ## Credentials in n8n
 
 Configure these in n8n's credential store (Settings, Credentials):
 
-- **Pipedrive API** (or HubSpot OAuth, or Salesforce OAuth) for T01.
+- **Pipedrive API** (or HubSpot OAuth, or Salesforce OAuth) for T01, T06.
 - **Stripe API** for T02 (used by some Stripe nodes if you extend the template, the webhook itself does not need it).
-- **Slack API** + **Slack incoming webhook URL** for T02, T03, T05.
-- **Telegram Bot API** for T03 (alert channel).
-- **OpenAI API** + **Anthropic API** for T05.
+- **Slack API** + **Slack incoming webhook URL** for T02, T03, T05, T11, T12, T13, T15.
+- **Telegram Bot API** for T03 (alert channel) + T14 (translator bot).
+- **OpenAI API** + **Anthropic API** for T05, T14, T15 (when LLM is involved).
 - **SMTP** or **Brevo** for T05 email digest.
+- **IMAP** for T11.
+- **Postgres** for T12, T13.
+- **Google Sheets OAuth2** for T12.
+- **GitHub** webhook signing secret for T07. **Calendly** v2 webhook signing for T06. **X / LinkedIn / Discord** OAuth for T08. **Google Calendar OAuth2** + **Microsoft Graph OAuth2** for T09. **CSV upload signing secret** for T10. **Notion API token** for T11, T15. **Audit ingest signing secret** for T13. **Telegram bot token** + **secret_token** for T14.
 
 ## Redis cluster swap (`$getWorkflowStaticData`)
 

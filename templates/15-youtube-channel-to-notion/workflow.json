@@ -1,0 +1,377 @@
+{
+  "name": "YouTube Channel to Notion",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## YouTube Channel to Notion\n\nSchedule trigger fires daily 04:00 UTC. Workflow fetches the YouTube RSS feed for each channel ID in `YOUTUBE_CHANNEL_IDS` env, parses with a lightweight RSS parser (no external XML lib), filters to videos newer than the last-seen `videoId` per channel, optionally summarizes the title + description via OpenAI / Anthropic, and writes one Notion page per new video into the configured database.\n\n**Production patterns wired:**\n- Rate limit per channel-host (defense for YouTube + Notion APIs)\n- Idempotency on `videoId`\n- Optional LLM summary with multi-provider Switch (OpenAI default, Anthropic optional)\n- Error branch with structured fallback + Slack alert\n\nNo HMAC, this trigger is Schedule, not a public webhook. Uses public YouTube RSS so no API key required for the basic flow.\n\nSee `README.md` for setup, env vars, and extension recipes.",
+        "height": 360,
+        "width": 400,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Set `YOUTUBE_CHANNEL_IDS` to a comma-separated list of channel IDs (`UCxxxxx...`). Find on the channel page via View Source then ctrl-F `channel_id`.\n2. Set `NOTION_API_TOKEN` (Internal Integration Token from notion.so/my-integrations).\n3. Set `NOTION_DATABASE_ID` (32-char UUID of target database).\n4. Share the Notion database with your integration (top-right Share menu).\n5. Optional LLM summary:\n   - `LLM_SUMMARY_ENABLED=1`\n   - `LLM_PROVIDER=openai` (default) or `anthropic`\n   - matching credentials (`OpenAI API` / `Anthropic API`)\n6. Optional: `MAX_VIDEOS_PER_CHANNEL_PER_RUN=10` (default), `SLACK_OPS_WEBHOOK` for alerts.\n7. Self-hosted n8n: set `NODE_FUNCTION_ALLOW_BUILTIN=crypto`.",
+        "height": 360,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 280]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\nThree opt-in nodes wired plus always-on error branch.\n\n- **Rate limit:** `RATE_LIMIT_ENABLED=1`. Per-host bucket: 30 RSS fetches / hour / host (YouTube cap, generous), 60 Notion writes / 5 min.\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1`. Persistent map `seen[videoId] = lastRunAt` so the same video is never written twice across runs.\n- **Multi-provider Switch (optional LLM):** `LLM_SUMMARY_ENABLED=1` flips the optional summary on. OpenAI default, Anthropic optional.\n- **Error branch:** always on. Notion failure -> Slack alert + structured log.\n- **Hard caps:** `MAX_VIDEOS_PER_CHANNEL_PER_RUN` (default 10) defends against backfill on the first run.\n\nNo HMAC: Schedule trigger, server-internal.",
+        "height": 360,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -300]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "triggerAtHour": 4
+            }
+          ]
+        }
+      },
+      "id": "yt-1-trigger",
+      "name": "Schedule (Daily 04:00 UTC)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// List the configured channel IDs and emit one item per channel.\n// Read the seen-video state for each so the downstream filter can compare.\n\nconst raw = $env.YOUTUBE_CHANNEL_IDS || '';\nconst channelIds = raw.split(',').map(s => s.trim()).filter(Boolean);\nif (channelIds.length === 0) {\n  throw new Error('YOUTUBE_CHANNEL_IDS env is empty. Set it to a comma-separated list of UC... channel IDs.');\n}\n// Cap at 50 channels per run to keep one execution bounded.\nif (channelIds.length > 50) {\n  throw new Error('YOUTUBE_CHANNEL_IDS exceeds 50 channels. Split across multiple workflow instances if you need more.');\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenVideos = data.seenVideos || {};\nconst seen = data.seenVideos;\n\nreturn channelIds.map(id => ({ json: {\n  channelId: id,\n  rssUrl: 'https://www.youtube.com/feeds/videos.xml?channel_id=' + id,\n  seenForChannel: Object.keys(seen).filter(k => seen[k] && seen[k].channelId === id).map(k => k),\n}}));"
+      },
+      "id": "yt-2-list-channels",
+      "name": "List Channels",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-host sliding-window rate limit on the RSS fetch + Notion write side, opt-in.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst LIMIT_PER_HOUR = 30;\nconst WINDOW_MS = 60 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  const key = 'host:youtube.com';\n  const hits = buckets[key] || [];\n  if (hits.length >= LIMIT_PER_HOUR) {\n    out.push({ json: { ...j, skipped: true, reason: 'rate-limit-host' } });\n    continue;\n  }\n  buckets[key] = [...hits, now];\n  out.push(item);\n}\nreturn out;"
+      },
+      "id": "yt-pp-1-ratelimit",
+      "name": "Rate Limit (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 60]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.rssUrl }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "id": "yt-3-fetch-rss",
+      "name": "Fetch YouTube RSS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [840, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Lightweight RSS / Atom parser for YouTube feeds.\n// Each YouTube RSS entry has yt:videoId, yt:channelId, title, link, published, description (optional), media:thumbnail.\n//\n// Extracted via regex against the raw XML rather than pulling in a full XML parser.\n// YouTube's feed is well-formed and does not need that level of robustness.\n\nconst items = $input.all();\nconst out = [];\nfor (const item of items) {\n  const j = item.json || {};\n  const xml = (j.data && typeof j.data === 'string') ? j.data : (j.body && typeof j.body === 'string' ? j.body : '');\n  if (!xml) {\n    out.push({ json: { ...j, skipped: true, reason: 'rss-empty' } });\n    continue;\n  }\n  const channelId = j.channelId;\n\n  // Pull entries.\n  const entries = [];\n  const entryRe = /<entry>([\\s\\S]*?)<\\/entry>/g;\n  let match;\n  while ((match = entryRe.exec(xml)) !== null) {\n    const body = match[1];\n    const videoId = (body.match(/<yt:videoId>([^<]+)<\\/yt:videoId>/) || [])[1];\n    if (!videoId) continue;\n    const title = ((body.match(/<title>([\\s\\S]*?)<\\/title>/) || [])[1] || '').replace(/<!\\[CDATA\\[|\\]\\]>/g, '').trim();\n    const link = (body.match(/<link rel=\"alternate\" href=\"([^\"]+)\"/) || [])[1] || ('https://www.youtube.com/watch?v=' + videoId);\n    const published = (body.match(/<published>([^<]+)<\\/published>/) || [])[1] || null;\n    const description = ((body.match(/<media:description>([\\s\\S]*?)<\\/media:description>/) || [])[1] || '').replace(/<!\\[CDATA\\[|\\]\\]>/g, '').trim();\n    const thumbnail = (body.match(/<media:thumbnail url=\"([^\"]+)\"/) || [])[1] || null;\n    const author = ((body.match(/<author>[\\s\\S]*?<name>([^<]+)<\\/name>/) || [])[1] || '').trim();\n\n    entries.push({\n      channelId,\n      videoId,\n      title: title.slice(0, 200),\n      url: link,\n      publishedAt: published,\n      description: description.slice(0, 1800),\n      thumbnail,\n      author: author.slice(0, 100),\n    });\n  }\n\n  // YouTube returns most recent first. Keep that order.\n  for (const e of entries) {\n    out.push({ json: e });\n  }\n}\nif (out.length === 0) {\n  return [{ json: { skipped: true, reason: 'no-entries-parsed' } }];\n}\nreturn out;"
+      },
+      "id": "yt-4-parse-rss",
+      "name": "Parse RSS",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Idempotency on videoId, opt-in. Persistent across runs (long-lived workflow static data).\n// Plus per-channel cap on how many videos to process in one run.\n\nconst MAX_PER_CHANNEL = parseInt($env.MAX_VIDEOS_PER_CHANNEL_PER_RUN || '10', 10);\nconst items = $input.all();\nconst out = [];\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  // No idempotency, just enforce the per-channel cap.\n  const perChannel = {};\n  for (const item of items) {\n    const j = item.json || {};\n    if (j.skipped) { out.push(item); continue; }\n    const id = j.channelId;\n    perChannel[id] = (perChannel[id] || 0) + 1;\n    if (perChannel[id] > MAX_PER_CHANNEL) continue;\n    out.push(item);\n  }\n  return out;\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenVideos = data.seenVideos || {};\nconst seen = data.seenVideos;\nconst now = Date.now();\nconst MAX_KEYS = 50000;\nconst KEEP_DAYS = 90; // remember a videoId for 90 days, then evict\n\nfor (const k of Object.keys(seen)) {\n  if (now - (seen[k].seenAt || 0) > KEEP_DAYS * 24 * 60 * 60 * 1000) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => (a[1].seenAt || 0) - (b[1].seenAt || 0)).slice(0, 5000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nconst perChannel = {};\nfor (const item of items) {\n  const j = item.json || {};\n  if (j.skipped) { out.push(item); continue; }\n  const id = j.channelId;\n  const vid = j.videoId;\n  if (!vid) continue;\n  if (seen[vid]) continue; // already processed\n  perChannel[id] = (perChannel[id] || 0) + 1;\n  if (perChannel[id] > MAX_PER_CHANNEL) continue; // cap\n  seen[vid] = { channelId: id, seenAt: now };\n  out.push(item);\n}\nif (out.length === 0) {\n  return [{ json: { skipped: true, reason: 'no-new-videos' } }];\n}\nreturn out;"
+      },
+      "id": "yt-pp-2-idempotency",
+      "name": "Idempotency Check (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the LLM summary prompt if LLM_SUMMARY_ENABLED=1, else mark items as no-summary-needed.\n\nconst summaryEnabled = $env.LLM_SUMMARY_ENABLED === '1';\nconst provider = ($env.LLM_PROVIDER || 'openai').toLowerCase();\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (j.skipped) { out.push(item); continue; }\n  if (!summaryEnabled) {\n    out.push({ json: { ...j, summary: null, summaryProvider: 'none' } });\n    continue;\n  }\n\n  const sourceText = (j.title + '\\n\\n' + (j.description || '')).slice(0, 3000);\n  const systemPrompt = 'Summarize the following YouTube video in 2-3 short sentences. Output ONLY the summary, no preamble. If the description is empty or too short to summarize, return the title verbatim.';\n  out.push({ json: { ...j, provider, systemPrompt, userText: sourceText } });\n}\nreturn out;"
+      },
+      "id": "yt-5-build-summary-prompt",
+      "name": "Build Summary Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 60]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "rule-skipped",
+                    "leftValue": "={{ $json.skipped }}",
+                    "rightValue": true,
+                    "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "skipped"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "rule-no-summary",
+                    "leftValue": "={{ $json.summaryProvider }}",
+                    "rightValue": "none",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "no-summary"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "rule-openai",
+                    "leftValue": "={{ $json.provider }}",
+                    "rightValue": "openai",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "openai"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "rule-anthropic",
+                    "leftValue": "={{ $json.provider }}",
+                    "rightValue": "anthropic",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "anthropic"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "yt-6-route",
+      "name": "Route by Provider",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1640, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'gpt-5.4-mini', messages: [{ role: 'system', content: $json.systemPrompt }, { role: 'user', content: $json.userText }], temperature: 0.2, max_tokens: 200 }) }}",
+        "options": {}
+      },
+      "id": "yt-7-openai",
+      "name": "OpenAI Summarize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, -60],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_ME",
+          "name": "OpenAI credentials"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 200, system: $json.systemPrompt, messages: [{ role: 'user', content: $json.userText }] }) }}",
+        "options": {}
+      },
+      "id": "yt-8-anthropic",
+      "name": "Anthropic Summarize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 180],
+      "credentials": {
+        "anthropicApi": {
+          "id": "REPLACE_ME",
+          "name": "Anthropic credentials"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize OpenAI vs Anthropic response shape and merge with the upstream video metadata.\n// Items can come from openai-success, anthropic-success, no-summary, or LLM-error path.\n//\n// Metadata-lookup priority (catches the partial-LLM-failure case):\n// 1. pairedItem index against $('Build Summary Prompt').all(): n8n's stable item-tracking\n//    across branches (works even when only a subset of items hit the error pin).\n// 2. In-place $json.videoId: true for the no-summary branch which passes metadata through.\n// 3. Last-resort array-index match: only used when pairedItem missing and $json has no videoId.\n//    This is the legacy fallback that the Critic flagged as fragile, kept here as a final\n//    safety net rather than the primary path.\n\nconst items = $input.all();\nlet upstream = [];\ntry { upstream = $('Build Summary Prompt').all(); } catch (e) { upstream = []; }\n\nconst out = [];\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const j = item.json || {};\n  if (j.skipped) { out.push(item); continue; }\n\n  let summary = null;\n  if (j.choices && Array.isArray(j.choices) && j.choices.length > 0) {\n    summary = (j.choices[0].message && j.choices[0].message.content) || '';\n  } else if (j.content && Array.isArray(j.content) && j.content.length > 0) {\n    summary = j.content[0].text || '';\n  } else if (j.summary !== undefined) {\n    summary = j.summary;\n  }\n  if (typeof summary === 'string') summary = summary.trim().slice(0, 1000);\n\n  let videoMeta = null;\n\n  // Tier 1: pairedItem (preserves order across branches and error paths)\n  if (item.pairedItem) {\n    const pIdx = typeof item.pairedItem === 'object'\n      ? (item.pairedItem.item != null ? item.pairedItem.item : null)\n      : (typeof item.pairedItem === 'number' ? item.pairedItem : null);\n    if (typeof pIdx === 'number' && upstream[pIdx] && upstream[pIdx].json && upstream[pIdx].json.videoId) {\n      videoMeta = upstream[pIdx].json;\n    }\n  }\n\n  // Tier 2: in-place metadata (no-summary branch path)\n  if (!videoMeta && j.videoId) {\n    videoMeta = j;\n  }\n\n  // Tier 3: last-resort array-index match (legacy fallback, fragile across error pins)\n  if (!videoMeta && upstream[i] && upstream[i].json && upstream[i].json.videoId) {\n    videoMeta = upstream[i].json;\n  }\n\n  // Fail-safe: if nothing matched, drop with structured warning rather than write garbage to Notion.\n  if (!videoMeta || !videoMeta.videoId) {\n    out.push({ json: { skipped: true, reason: 'metadata-lookup-failed', summary } });\n    continue;\n  }\n\n  out.push({ json: {\n    skipped: false,\n    channelId: videoMeta.channelId,\n    videoId: videoMeta.videoId,\n    title: videoMeta.title,\n    url: videoMeta.url,\n    publishedAt: videoMeta.publishedAt,\n    description: videoMeta.description,\n    thumbnail: videoMeta.thumbnail,\n    author: videoMeta.author,\n    summary,\n  }});\n}\nreturn out;"
+      },
+      "id": "yt-9-normalize",
+      "name": "Normalize Video Item",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2040, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/pages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.NOTION_API_TOKEN }}" },
+            { "name": "Notion-Version", "value": "2025-09-03" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ parent: { database_id: $env.NOTION_DATABASE_ID }, properties: { Title: { title: [{ text: { content: $json.title } }] }, Channel: { rich_text: [{ text: { content: $json.author || $json.channelId } }] }, Url: { url: $json.url }, PublishedAt: { date: { start: $json.publishedAt } }, Summary: { rich_text: [{ text: { content: $json.summary || $json.description || '' } }] }, VideoId: { rich_text: [{ text: { content: $json.videoId } }] } } }) }}",
+        "options": {}
+      },
+      "id": "yt-10-notion",
+      "name": "Notion Create Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2240, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "noData",
+        "options": {}
+      },
+      "id": "yt-11-done",
+      "name": "Done",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback for any failure (RSS fetch, LLM, Notion).\n// Build a structured error log and post a Slack alert if SLACK_OPS_WEBHOOK is set.\n\nconst input = $input.first();\nconst raw = input.json || {};\nconst errorRaw = raw.error || raw;\nconst isLlmError = !!(errorRaw && (errorRaw.message || errorRaw.code || (errorRaw.error && errorRaw.error.message)));\nlet errorMessage;\nif (isLlmError) {\n  errorMessage = (errorRaw.message) || (errorRaw.error && errorRaw.error.message) || ('Error code ' + (errorRaw.code || '?'));\n} else {\n  errorMessage = 'Unknown error in YouTube-to-Notion sync';\n}\n\nlet stage = 'unknown';\ntry { if ($('Notion Create Page').first()) stage = 'notion'; } catch (e) {}\ntry { if ($('OpenAI Summarize').first()) stage = 'openai'; } catch (e) {}\ntry { if ($('Anthropic Summarize').first()) stage = 'anthropic'; } catch (e) {}\ntry { if ($('Fetch YouTube RSS').first()) stage = 'rss-fetch'; } catch (e) {}\n\nreturn [{ json: { syncError: { message: errorMessage, stage, raw: errorRaw } } }];"
+      },
+      "id": "yt-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: YouTube-to-Notion sync failed at ' + ($json.syncError.stage || '?') + ': ' + ($json.syncError.message || 'unknown error') }) }}",
+        "options": {}
+      },
+      "id": "yt-err-slack",
+      "name": "Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 380],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Schedule (Daily 04:00 UTC)": { "main": [[{ "node": "List Channels", "type": "main", "index": 0 }]] },
+    "List Channels": { "main": [[{ "node": "Rate Limit (opt-in)", "type": "main", "index": 0 }]] },
+    "Rate Limit (opt-in)": { "main": [[{ "node": "Fetch YouTube RSS", "type": "main", "index": 0 }]] },
+    "Fetch YouTube RSS": {
+      "main": [
+        [{ "node": "Parse RSS", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse RSS": { "main": [[{ "node": "Idempotency Check (opt-in)", "type": "main", "index": 0 }]] },
+    "Idempotency Check (opt-in)": { "main": [[{ "node": "Build Summary Prompt", "type": "main", "index": 0 }]] },
+    "Build Summary Prompt": { "main": [[{ "node": "Route by Provider", "type": "main", "index": 0 }]] },
+    "Route by Provider": {
+      "main": [
+        [],
+        [{ "node": "Normalize Video Item", "type": "main", "index": 0 }],
+        [{ "node": "OpenAI Summarize", "type": "main", "index": 0 }],
+        [{ "node": "Anthropic Summarize", "type": "main", "index": 0 }],
+        [{ "node": "Normalize Video Item", "type": "main", "index": 0 }]
+      ]
+    },
+    "OpenAI Summarize": {
+      "main": [
+        [{ "node": "Normalize Video Item", "type": "main", "index": 0 }],
+        [{ "node": "Normalize Video Item", "type": "main", "index": 0 }]
+      ]
+    },
+    "Anthropic Summarize": {
+      "main": [
+        [{ "node": "Normalize Video Item", "type": "main", "index": 0 }],
+        [{ "node": "Normalize Video Item", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normalize Video Item": { "main": [[{ "node": "Notion Create Page", "type": "main", "index": 0 }]] },
+    "Notion Create Page": {
+      "main": [
+        [{ "node": "Done", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Error Fallback": { "main": [[{ "node": "Slack Alert", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

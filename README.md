@@ -10,10 +10,10 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![n8n compatible](https://img.shields.io/badge/n8n-2.10.1%2B-FF6E5C.svg)](https://n8n.io)
-[![Templates](https://img.shields.io/badge/templates-10%20live-brightgreen.svg)](#templates)
+[![Templates](https://img.shields.io/badge/templates-15%20live-brightgreen.svg)](#templates)
 [![CI](https://github.com/studiomeyer-io/n8n-workflows/actions/workflows/validate-workflows.yml/badge.svg)](https://github.com/studiomeyer-io/n8n-workflows/actions)
 
-CRM router · Stripe · uptime · SSL · Slack digest · Calendly · GitHub · RSS · calendar conflicts · CSV validator · no memory required
+CRM router · Stripe · uptime · SSL · Slack digest · Calendly · GitHub · RSS · calendar · CSV · Email-Notion · Postgres-Sheets · Webhook audit · Telegram translator · YouTube-Notion · no memory required
 
 [Quick Start](#quick-start) · [Templates](#templates) · [Production Patterns](#production-patterns) · [Memory Variant](#memory-variant)
 
@@ -58,8 +58,13 @@ Detailed walkthrough per template lives inside each `templates/NN-slug/README.md
 | 8 | [RSS to Multi-Channel Social](./templates/08-rss-to-multi-channel-social/) | Schedule cron | none | rate limit (per-feed-host), 7-day idempotency on guid, per-channel error branch | Hardened (v0.2.0) |
 | 9 | [Calendar Conflict Detector](./templates/09-calendar-conflict-detector/) | Schedule daily | none | rate limit (per-calendar), 24h idempotency on conflict-pair hash, per-calendar error branch | Hardened (v0.2.0) |
 | 10 | [CSV Bulk Validator](./templates/10-csv-bulk-validator/) | Webhook (CSV upload) | none | HMAC + replay-window, rate limit, idempotency on `sha256(rawBody)`, ReDoS-protected schema regexes, error branch | Hardened (v0.2.0) |
+| 11 | [Email to Notion](./templates/11-email-to-notion/) | IMAP poll | none | filter (sender + subject opt-in), rate limit (Notion writes), idempotency on Message-ID hash, error branch | Hardened (v0.3.0) |
+| 12 | [Postgres to Google Sheets Sync](./templates/12-postgres-to-sheets-sync/) | Schedule daily | none | rate limit, idempotency on row PK (24h), `MAX_ROWS_PER_RUN` cap, HWM-only-on-success, error branch | Hardened (v0.3.0) |
+| 13 | [Webhook Audit Trail](./templates/13-webhook-audit-trail/) | Webhook (signed event ingest) | none | HMAC + replay-window, rate limit per IP, idempotency, hash-chain across rows, security + capacity Slack alerts | Hardened (v0.3.0) |
+| 14 | [Telegram Translator Bot](./templates/14-telegram-translator-bot/) | Telegram | yes (multi-provider) | Telegram secret_token, rate limit per user_id, idempotency on update_id, LLM fallback with `isLlmError` discriminator, error branch | Hardened (v0.3.0) |
+| 15 | [YouTube Channel to Notion](./templates/15-youtube-channel-to-notion/) | Schedule daily | optional (multi-provider) | rate limit per host, 90d videoId idempotency, `MAX_VIDEOS_PER_CHANNEL_PER_RUN` cap, optional LLM summary, error branch | Hardened (v0.3.0) |
 
-T01 is the BANT scoring + multi-CRM router (Pipedrive / HubSpot / Salesforce switch). T02 is the Stripe webhook with proper signature verification and per-event-type Slack messages. T03 is the schedule-based HTTP uptime check with retry-with-backoff and Slack/Telegram alerts. T04 is the daily SSL cert expiry watcher across multiple domains. T05 is the multi-provider LLM Slack digest (Claude / OpenAI / Gemini fallback chain). T06 mirrors Calendly v2 booking events into the same multi-CRM Switch as T01 (Pipedrive default). T07 mirrors GitHub issue events into a multi-tracker Switch (Linear default GraphQL, Jira REST, ClickUp REST), then comments back on the GitHub issue with the tracker URL. T08 fans out RSS items into X / LinkedIn / Discord with per-channel error branches and a 7-day in-memory dedup window. T09 polls Google Calendar v3 or Microsoft Graph for the next 7 days and posts a Slack alert per detected double-booking with 24h dedup. T10 accepts a CSV upload (HMAC-signed and replay-window protected when configured) and returns a structured `{valid, invalid, summary}` report.
+T01 is the BANT scoring + multi-CRM router (Pipedrive / HubSpot / Salesforce switch). T02 is the Stripe webhook with proper signature verification and per-event-type Slack messages. T03 is the schedule-based HTTP uptime check with retry-with-backoff and Slack/Telegram alerts. T04 is the daily SSL cert expiry watcher across multiple domains. T05 is the multi-provider LLM Slack digest (Claude / OpenAI / Gemini fallback chain). T06 mirrors Calendly v2 booking events into the same multi-CRM Switch as T01 (Pipedrive default). T07 mirrors GitHub issue events into a multi-tracker Switch (Linear default GraphQL, Jira REST, ClickUp REST), then comments back on the GitHub issue with the tracker URL. T08 fans out RSS items into X / LinkedIn / Discord with per-channel error branches and a 7-day in-memory dedup window. T09 polls Google Calendar v3 or Microsoft Graph for the next 7 days and posts a Slack alert per detected double-booking with 24h dedup. T10 accepts a CSV upload (HMAC-signed and replay-window protected when configured) and returns a structured `{valid, invalid, summary}` report. T11 polls an IMAP mailbox and writes filtered emails into a Notion database with attachment-count, message-ID dedup, and Slack-on-Notion-failure. T12 reads a parametrized Postgres SELECT with a high-water-mark, dedupes by row primary key, caps at `MAX_ROWS_PER_RUN`, appends to Google Sheets, and only advances the HWM when the append succeeded. T13 is a generic signed-event ingest endpoint with HMAC + replay-window, an audit table that includes a `prev_hash` -> `row_hash` chain so tampering becomes detectable, plus Slack alerts on signature-fail and rate-limit-hit. T14 is a Telegram bot that detects the source language of any incoming text and replies with a translation in the configured target language, multi-provider Switch (OpenAI default, Anthropic optional). T15 watches a list of YouTube channels via public RSS, dedupes by videoId for 90 days, optionally LLM-summarizes title + description, writes one Notion page per new video.
 
 More templates land per release cadence. See [STATUS.md](./STATUS.md) for ground truth on what is hardened, what is in-progress, and what is on the roadmap.
 
@@ -186,7 +191,12 @@ n8n-workflows/
     ├── 07-github-issues-to-tracker/
     ├── 08-rss-to-multi-channel-social/
     ├── 09-calendar-conflict-detector/
-    └── 10-csv-bulk-validator/
+    ├── 10-csv-bulk-validator/
+    ├── 11-email-to-notion/
+    ├── 12-postgres-to-sheets-sync/
+    ├── 13-webhook-audit-trail/
+    ├── 14-telegram-translator-bot/
+    └── 15-youtube-channel-to-notion/
 ```
 
 Each template folder is self-contained. Copy any one of them out of this repo and it still works.

@@ -1,0 +1,195 @@
+{
+  "name": "Email to Notion",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Email to Notion\n\nIMAP polls a mailbox, parses each new message, optionally filters by sender domain or subject keyword, and writes a structured row into a Notion database (subject, from, snippet, received-at, attachment-count, raw-message-id link).\n\nSet of patterns wired:\n- Idempotency on Message-ID hash (the same email, fetched twice, lands in Notion once)\n- Rate limit on the Notion API call (defense if a flood arrives)\n- Per-domain or per-subject filter (opt-in)\n- Error branch with Slack alert\n\nNo HMAC, this trigger is IMAP poll, not a public webhook.\n\nSee `README.md` for setup, env vars, and extension recipes.",
+        "height": 320,
+        "width": 400,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Create an n8n IMAP credential pointing at the mailbox you want to mirror.\n2. Set `NOTION_API_TOKEN` (Internal Integration Token from notion.so/my-integrations).\n3. Set `NOTION_DATABASE_ID` (32-char UUID of the target database).\n4. Share the database with your Notion integration (top-right Share menu in the database page).\n5. Optional: `EMAIL_FROM_WHITELIST=domain1.com,domain2.com` and / or `EMAIL_SUBJECT_INCLUDE=invoice,receipt,order`.\n6. Optional: `SLACK_OPS_WEBHOOK` for error alerts.\n7. Self-hosted n8n: set `NODE_FUNCTION_ALLOW_BUILTIN=crypto`.",
+        "height": 320,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 240]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\nThree opt-in nodes wired, default-off so the import boots clean.\n\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 ops / 5 min, defense for the Notion API call)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (5-min window on Message-ID hash)\n- **Filter:** `EMAIL_FROM_WHITELIST` and / or `EMAIL_SUBJECT_INCLUDE` (opt-in, comma-separated)\n- **Error branch:** always on. Notion failure -> Slack alert + structured log.\n\nNo HMAC: IMAP poll trigger is server-to-server, not public.\n\nFor clustered n8n, swap the in-memory dedup for Redis SET NX EX 300. Snippet in the node's comments.",
+        "height": 320,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    },
+    {
+      "parameters": {
+        "mailbox": "INBOX",
+        "postProcessAction": "read",
+        "options": {
+          "allowUnauthorizedCerts": false,
+          "forceReconnect": 60
+        }
+      },
+      "id": "email-1-trigger",
+      "name": "IMAP Email",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [240, 60],
+      "credentials": {
+        "imap": {
+          "id": "REPLACE_ME",
+          "name": "IMAP credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Skip non-text messages or those without a Message-ID (rare, but possible).\n// Decide whether to-process or to-skip based on whitelist envs.\n\nconst item = $input.first();\nconst json = item.json || {};\nconst headers = json.headers || {};\nconst messageId = headers['message-id'] || headers['Message-ID'] || json.messageId;\nconst from = (json.from && (json.from.text || (Array.isArray(json.from.value) && json.from.value[0] && json.from.value[0].address))) || '';\nconst subject = String(json.subject || '');\n\nif (!messageId) {\n  return [{ json: { skipped: true, reason: 'no-message-id', subject, from } }];\n}\n\nconst whitelistRaw = $env.EMAIL_FROM_WHITELIST || '';\nconst whitelist = whitelistRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);\nif (whitelist.length > 0) {\n  const fromLower = String(from).toLowerCase();\n  const matched = whitelist.some(domain => fromLower.includes('@' + domain) || fromLower.endsWith('@' + domain) || fromLower.includes('<' + domain) || fromLower === domain);\n  if (!matched) {\n    return [{ json: { skipped: true, reason: 'from-domain-not-whitelisted', from, subject } }];\n  }\n}\n\nconst includeRaw = $env.EMAIL_SUBJECT_INCLUDE || '';\nconst include = includeRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);\nif (include.length > 0) {\n  const subjLower = subject.toLowerCase();\n  const matched = include.some(kw => subjLower.includes(kw));\n  if (!matched) {\n    return [{ json: { skipped: true, reason: 'subject-keyword-not-matched', subject, from } }];\n  }\n}\n\nreturn [{\n  json: {\n    skipped: false,\n    messageId,\n    from,\n    subject,\n    raw: json,\n  },\n}];"
+      },
+      "id": "email-2-filter",
+      "name": "Filter Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-key sliding-window rate limit on the Notion API call, opt-in.\n// Default 60 ops / 5 min, scoped to the workflow as a whole.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst key = 'notion-write';\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' Notion writes per ' + Math.round(WINDOW_MS / 60000) + ' minutes reached');\n}\nbuckets[key] = [...hits, now];\n\nreturn $input.all();"
+      },
+      "id": "email-pp-1-ratelimit",
+      "name": "Rate Limit (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 5-minute idempotency window on Message-ID hash, opt-in.\n// Skips items where Filter already marked skipped=true.\n\nconst crypto = require('crypto');\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return $input.all();\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 500);\n  for (const [k] of oldest) delete seen[k];\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (j.skipped) { out.push(item); continue; }\n  const messageId = j.messageId || '';\n  const dedupKey = crypto.createHash('sha256').update(String(messageId), 'utf8').digest('hex').slice(0, 32);\n  if (seen[dedupKey]) {\n    out.push({ json: { ...j, skipped: true, reason: 'duplicate-message-id', dedupKey } });\n    continue;\n  }\n  seen[dedupKey] = now;\n  out.push(item);\n}\nreturn out;\n\n// Redis variant for clustered n8n:\n// const result = await redis.set('email-idem:' + dedupKey, '1', 'EX', 300, 'NX');\n// if (result === null) treat-as-duplicate;"
+      },
+      "id": "email-pp-2-idempotency",
+      "name": "Idempotency Check (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize the email payload into a stable Notion page-create shape.\n// Strip HTML to plain text for the snippet. Cap snippet length.\n\nconst stripHtml = (s) => String(s || '')\n  .replace(/<style[\\s\\S]*?<\\/style>/gi, '')\n  .replace(/<script[\\s\\S]*?<\\/script>/gi, '')\n  .replace(/<[^>]+>/g, ' ')\n  .replace(/&nbsp;/gi, ' ')\n  .replace(/&amp;/gi, '&')\n  .replace(/&lt;/gi, '<')\n  .replace(/&gt;/gi, '>')\n  .replace(/&quot;/gi, '\"')\n  .replace(/&#x27;/gi, \"'\")\n  .replace(/&#39;/gi, \"'\")\n  .replace(/\\s+/g, ' ')\n  .trim();\n\nconst SNIPPET_LIMIT = 1800; // Notion rich_text segment soft-limit ~2000 chars\nconst SUBJECT_LIMIT = 200;\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (j.skipped) {\n    out.push({ json: { ...j, normalizedSkipped: true } });\n    continue;\n  }\n  const raw = j.raw || {};\n  const subject = String(j.subject || '(no subject)').slice(0, SUBJECT_LIMIT);\n  const from = String(j.from || '').slice(0, 200);\n  const bodyText = raw.text || stripHtml(raw.html || '');\n  const snippet = String(bodyText).slice(0, SNIPPET_LIMIT);\n  const receivedAt = (raw.date && new Date(raw.date).toISOString()) || new Date().toISOString();\n  const attachments = Array.isArray(raw.attachments) ? raw.attachments : [];\n\n  out.push({ json: {\n    skipped: false,\n    messageId: j.messageId,\n    subject,\n    from,\n    snippet,\n    receivedAt,\n    attachmentCount: attachments.length,\n  }});\n}\nreturn out;"
+      },
+      "id": "email-3-normalize",
+      "name": "Normalize Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pass-through filter: drops items already marked skipped, only forwards real ones.\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (!j.skipped) out.push(item);\n}\nif (out.length === 0) {\n  return [{ json: { skipped: true, reason: 'all-items-filtered-or-deduped' } }];\n}\nreturn out;"
+      },
+      "id": "email-4-passthrough",
+      "name": "Forward Live Items Only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/pages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.NOTION_API_TOKEN }}" },
+            { "name": "Notion-Version", "value": "2025-09-03" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ parent: { database_id: $env.NOTION_DATABASE_ID }, properties: { Subject: { title: [{ text: { content: $json.subject } }] }, From: { rich_text: [{ text: { content: $json.from } }] }, Snippet: { rich_text: [{ text: { content: $json.snippet } }] }, ReceivedAt: { date: { start: $json.receivedAt } }, Attachments: { number: $json.attachmentCount }, MessageId: { rich_text: [{ text: { content: $json.messageId } }] } } }) }}",
+        "options": {}
+      },
+      "id": "email-5-notion",
+      "name": "Notion Create Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "noData",
+        "options": {}
+      },
+      "id": "email-6-done",
+      "name": "Done",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback when the Notion call fails. Build a structured error log\n// and post a Slack alert if SLACK_OPS_WEBHOOK is set.\n\nconst input = $input.first();\nconst raw = input.json || {};\nconst errorRaw = raw.error || raw;\nconst isHttpError = !!(errorRaw && (errorRaw.message || errorRaw.code));\nconst errorMessage = isHttpError ? (errorRaw.message || 'Notion API error') : 'Unknown error: ' + JSON.stringify(errorRaw).slice(0, 200);\n\n// Pull the email metadata for the alert. Fall back gracefully if missing.\nconst forward = $('Forward Live Items Only').first();\nconst emailMeta = (forward && forward.json) || {};\n\nreturn [{\n  json: {\n    notionError: { message: errorMessage, raw: errorRaw },\n    email: { subject: emailMeta.subject, from: emailMeta.from, messageId: emailMeta.messageId },\n  },\n}];"
+      },
+      "id": "email-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: Notion write failed for email \"' + ($json.email.subject || '?') + '\" from ' + ($json.email.from || '?') + ': ' + ($json.notionError.message || 'unknown error') }) }}",
+        "options": {}
+      },
+      "id": "email-err-slack",
+      "name": "Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1640, 380],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "IMAP Email": { "main": [[{ "node": "Filter Email", "type": "main", "index": 0 }]] },
+    "Filter Email": { "main": [[{ "node": "Rate Limit (opt-in)", "type": "main", "index": 0 }]] },
+    "Rate Limit (opt-in)": { "main": [[{ "node": "Idempotency Check (opt-in)", "type": "main", "index": 0 }]] },
+    "Idempotency Check (opt-in)": { "main": [[{ "node": "Normalize Email", "type": "main", "index": 0 }]] },
+    "Normalize Email": { "main": [[{ "node": "Forward Live Items Only", "type": "main", "index": 0 }]] },
+    "Forward Live Items Only": { "main": [[{ "node": "Notion Create Page", "type": "main", "index": 0 }]] },
+    "Notion Create Page": {
+      "main": [
+        [{ "node": "Done", "type": "main", "index": 0 }],
+        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Error Fallback": { "main": [[{ "node": "Slack Alert", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
