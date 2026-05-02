@@ -12,7 +12,10 @@
       "name": "Sticky Note - Intro",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, -100]
+      "position": [
+        -200,
+        -100
+      ]
     },
     {
       "parameters": {
@@ -27,18 +30,24 @@
       "name": "Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [240, 60],
+      "position": [
+        240,
+        60
+      ],
       "webhookId": "your-trigger"
     },
     {
       "parameters": {
-        "jsCode": "// Replace with your trigger normalization. Map provider-specific\n// fields to a stable schema the rest of the workflow can rely on.\n\nconst body = $input.first().body || {};\n\nreturn [{ json: {\n  receivedAt: new Date().toISOString(),\n  body,\n} }];"
+        "jsCode": "// Replace with your trigger normalization. Map provider-specific\n// fields to a stable schema the rest of the workflow can rely on.\n\nconst body = $input.first().json.body || {};\n\nreturn [{ json: {\n  receivedAt: new Date().toISOString(),\n  body,\n} }];"
       },
       "id": "tpl-2-normalize",
       "name": "Normalize Payload",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [440, 60]
+      "position": [
+        440,
+        60
+      ]
     },
     {
       "parameters": {
@@ -52,7 +61,10 @@
       "name": "Respond",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [640, 60]
+      "position": [
+        640,
+        60
+      ]
     }
   ],
   "connections": {

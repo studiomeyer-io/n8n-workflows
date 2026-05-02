@@ -1,0 +1,23 @@
+{
+  "action": "opened",
+  "issue": {
+    "id": 1234567890,
+    "number": 42,
+    "title": "Bug: form submission silently drops on Safari 17",
+    "body": "Repro:\n1. Open the lead form on safari 17 mobile\n2. Submit\n3. Form clears but no entry shows in CRM\n\nExpected: lead is created\nActual: nothing happens, no error in console",
+    "html_url": "https://github.com/studiomeyer-io/n8n-workflows/issues/42",
+    "state": "open",
+    "labels": [
+      { "name": "bug" },
+      { "name": "regression" },
+      { "name": "priority:high" }
+    ]
+  },
+  "repository": {
+    "full_name": "studiomeyer-io/n8n-workflows",
+    "html_url": "https://github.com/studiomeyer-io/n8n-workflows"
+  },
+  "sender": {
+    "login": "maria-acme"
+  }
+}

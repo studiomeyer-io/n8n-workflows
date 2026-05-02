@@ -1,0 +1,19 @@
+{
+  "actor": {
+    "id": "user_42",
+    "email": "maria@acme-mittelstand.de",
+    "ip": "203.0.113.42"
+  },
+  "action": "deal.create",
+  "resource": {
+    "type": "crm_deal",
+    "id": "deal_abc123"
+  },
+  "metadata": {
+    "amount": 12500,
+    "currency": "EUR",
+    "stage": "qualified",
+    "owner": "matthias@studiomeyer.io"
+  },
+  "timestamp": "2026-05-02T10:15:00Z"
+}

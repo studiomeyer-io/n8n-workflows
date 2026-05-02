@@ -3,7 +3,7 @@
   "nodes": [
     {
       "parameters": {
-        "content": "## Webhook Audit Trail\n\nGeneric ingest endpoint that any system can POST signed events to. Verifies the HMAC + replay-window, rate-limits, dedupes, persists to a Postgres `audit_log` table with an atomic hash chain across rows, alerts Slack on signature-fail (security event) and rate-limit-hit (DoS event).\n\n**Production patterns wired:**\n- HMAC + replay-window verify (opt-in)\n- Rate limit + per-IP cap\n- Idempotency on `x-request-id` or `sha256(rawBody)`\n- Atomic hash chain in a single SQL statement: `SELECT ... FOR UPDATE` locks the latest row + `digest()` computes the new `row_hash` inside the same transaction. Survives n8n restarts (state is in DB) and is race-safe across concurrent executions.\n- Error branch with structured fallback\n- Slack alert on security or capacity events (not on every successful write)\n\nSee `README.md` for setup, env vars, and extension recipes.",
+        "content": "## Webhook Audit Trail\n\nGeneric ingest endpoint that any system can POST signed events to. Verifies the HMAC + replay-window, rate-limits, dedupes, persists to a Postgres `audit_log` table with an atomic hash chain across rows, alerts Slack on signature-fail (security event) and rate-limit-hit (DoS event).\n\n**Production patterns wired:**\n- HMAC + replay-window verify (opt-in)\n- Rate limit + per-IP cap\n- Idempotency on `x-request-id` or `sha256(rawBody)`\n- Atomic hash chain in a single SQL statement: a transaction-scoped `pg_advisory_xact_lock` serializes all inserts on the same chain key, the latest row is read with `FOR UPDATE` as a belt-and-suspenders defense, and `digest()` from `pgcrypto` computes the new `row_hash` inside the same transaction. Survives n8n restarts (state is in DB) and is race-safe across concurrent executions.\n- Error branch with structured fallback\n- Slack alert on security or capacity events (not on every successful write)\n\nSee `README.md` for setup, env vars, and extension recipes.",
         "height": 360,
         "width": 400,
         "color": 6
@@ -12,7 +12,10 @@
       "name": "Sticky Note - Intro",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, -100]
+      "position": [
+        -200,
+        -100
+      ]
     },
     {
       "parameters": {
@@ -25,11 +28,14 @@
       "name": "Sticky Note - Setup",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, 280]
+      "position": [
+        -200,
+        280
+      ]
     },
     {
       "parameters": {
-        "content": "## Production Patterns\n\nFour patterns wired. HMAC verify is the most important, this is an ingest endpoint.\n\n- **HMAC + replay-window:** `WEBHOOK_INTEGRITY_CHECK_ENABLED=1` + `AUDIT_SIGNING_SECRET`. Signed payload `<timestamp>.<rawBody>`, default 5-min replay window.\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 req / 5 min / IP)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (5-min window on `x-request-id` or hash(rawBody)). The Idempotency node runs `onError: continueErrorOutput` so an unexpected static-data corruption is caught and routed to the Error Fallback rather than escaping as an unhandled exception.\n- **Atomic hash chain:** the Postgres Insert is a single SQL statement using `WITH last AS (SELECT ... FOR UPDATE) INSERT ...`. The previous row's `row_hash` is locked for update during the insert, so two concurrent inserts cannot both read the same `prev_hash`. The hash is computed in SQL via `digest()` from `pgcrypto` so the chain integrity holds across n8n restarts (no static-data bridge needed).\n- **Error branch:** always on. DB failure -> structured 500 + Slack alert (DB outage is a security event, audit chain breaks).\n\nFor clustered n8n, the in-memory dedup is per-instance. Swap to Redis SET NX EX 300 for cross-instance dedup. Snippet in the node's comments.",
+        "content": "## Production Patterns\n\nFour patterns wired. HMAC verify is the most important, this is an ingest endpoint.\n\n- **HMAC + replay-window:** `WEBHOOK_INTEGRITY_CHECK_ENABLED=1` + `AUDIT_SIGNING_SECRET`. Signed payload `<timestamp>.<rawBody>`, default 5-min replay window.\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 req / 5 min / IP)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (5-min window on `x-request-id` or hash(rawBody)). The Idempotency node runs `onError: continueErrorOutput` so an unexpected static-data corruption is caught and routed to the Error Fallback rather than escaping as an unhandled exception.\n- **Atomic hash chain:** the Postgres Insert is a single SQL statement that wraps `pg_advisory_xact_lock(hashtext('audit_log_chain:default'))` in a `MATERIALIZED` CTE referenced via `CROSS JOIN` by the `last` CTE. PostgreSQL is forced to acquire the transaction-scoped advisory lock before scanning `audit_log`, so two concurrent inserts cannot read the same `prev_hash`. The `FOR UPDATE` row-lock is kept as a belt-and-suspenders defense against direct SQL writers that bypass this workflow. The hash is computed in SQL via `digest()` from `pgcrypto` so the chain integrity holds across n8n restarts (no static-data bridge needed).\n- **Error branch:** always on. DB failure -> structured 500 + Slack alert (DB outage is a security event, audit chain breaks).\n\nFor clustered n8n, the in-memory dedup is per-instance. Swap to Redis SET NX EX 300 for cross-instance dedup. Snippet in the node's comments.",
         "height": 380,
         "width": 380,
         "color": 7
@@ -38,7 +44,10 @@
       "name": "Sticky Note - Production Patterns",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [840, -300]
+      "position": [
+        840,
+        -300
+      ]
     },
     {
       "parameters": {
@@ -53,18 +62,24 @@
       "name": "Audit Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [240, 60],
+      "position": [
+        240,
+        60
+      ],
       "webhookId": "audit-ingest"
     },
     {
       "parameters": {
-        "jsCode": "// HMAC-SHA256 signature verification on raw body, opt-in, with replay-window check.\n// Headers required when WEBHOOK_INTEGRITY_CHECK_ENABLED=1:\n//   x-audit-signature: <hex hmac-sha256(timestamp + '.' + rawBody)>\n//   x-audit-timestamp: <unix-seconds>\n// Plus body-size cap.\n\nconst secret = $env.AUDIT_SIGNING_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nconst MAX_BODY_BYTES = parseInt($env.MAX_BODY_BYTES || '1048576', 10);\nconst item = $input.first();\nconst rawBody = item.rawBody || (typeof item.body === 'string' ? item.body : JSON.stringify(item.body || {}));\nif (Buffer.byteLength(String(rawBody), 'utf8') > MAX_BODY_BYTES) {\n  throw new Error('PAYLOAD_TOO_LARGE: body exceeds MAX_BODY_BYTES=' + MAX_BODY_BYTES);\n}\n\nif (!secret || !integrityCheckEnabled) {\n  // Verification disabled, mark as unsigned and pass through.\n  return [{ json: { signed: false, rawBody, headers: item.headers || {} } }];\n}\n\nconst crypto = require('crypto');\nconst headers = item.headers || {};\nconst providedSig = headers['x-audit-signature'] || headers['X-Audit-Signature'];\nconst tsHeader = headers['x-audit-timestamp'] || headers['X-Audit-Timestamp'];\n\nif (!providedSig || typeof providedSig !== 'string') {\n  throw new Error('UNAUTHORIZED: missing x-audit-signature header');\n}\nif (!tsHeader || typeof tsHeader !== 'string') {\n  throw new Error('UNAUTHORIZED: missing x-audit-timestamp header (replay protection)');\n}\n\nconst tsNum = parseInt(tsHeader, 10);\nif (!Number.isFinite(tsNum)) {\n  throw new Error('UNAUTHORIZED: invalid x-audit-timestamp value');\n}\nconst nowSec = Math.floor(Date.now() / 1000);\nconst REPLAY_WINDOW_S = parseInt($env.AUDIT_REPLAY_WINDOW_S || '300', 10);\nif (Math.abs(nowSec - tsNum) > REPLAY_WINDOW_S) {\n  throw new Error('UNAUTHORIZED: timestamp outside replay window (' + REPLAY_WINDOW_S + 's)');\n}\n\nconst signedPayload = tsHeader + '.' + rawBody;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');\n\nif (providedSig.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expBuf = Buffer.from(expected, 'utf8');\nconst provBuf = Buffer.from(providedSig, 'utf8');\nif (!crypto.timingSafeEqual(expBuf, provBuf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [{ json: { signed: true, rawBody, headers, timestamp: tsNum } }];"
+        "jsCode": "// HMAC-SHA256 signature verification on raw body, opt-in, with replay-window check.\n// Headers required when WEBHOOK_INTEGRITY_CHECK_ENABLED=1:\n//   x-audit-signature: <hex hmac-sha256(timestamp + '.' + rawBody)>\n//   x-audit-timestamp: <unix-seconds>\n// Plus body-size cap.\n\nconst secret = $env.AUDIT_SIGNING_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nconst MAX_BODY_BYTES = parseInt($env.MAX_BODY_BYTES || '1048576', 10);\nconst item = $input.first();\nconst rawBody = item.json.rawBody || (typeof item.json.body === 'string' ? item.json.body : JSON.stringify(item.json.body || {}));\nif (Buffer.byteLength(String(rawBody), 'utf8') > MAX_BODY_BYTES) {\n  throw new Error('PAYLOAD_TOO_LARGE: body exceeds MAX_BODY_BYTES=' + MAX_BODY_BYTES);\n}\n\nif (!secret || !integrityCheckEnabled) {\n  // Verification disabled, mark as unsigned and pass through.\n  return [{ json: { signed: false, rawBody, headers: item.json.headers || {} } }];\n}\n\nconst crypto = require('crypto');\nconst headers = item.json.headers || {};\nconst providedSig = headers['x-audit-signature'] || headers['X-Audit-Signature'];\nconst tsHeader = headers['x-audit-timestamp'] || headers['X-Audit-Timestamp'];\n\nif (!providedSig || typeof providedSig !== 'string') {\n  throw new Error('UNAUTHORIZED: missing x-audit-signature header');\n}\nif (!tsHeader || typeof tsHeader !== 'string') {\n  throw new Error('UNAUTHORIZED: missing x-audit-timestamp header (replay protection)');\n}\n\nconst tsNum = parseInt(tsHeader, 10);\nif (!Number.isFinite(tsNum)) {\n  throw new Error('UNAUTHORIZED: invalid x-audit-timestamp value');\n}\nconst nowSec = Math.floor(Date.now() / 1000);\nconst REPLAY_WINDOW_S = parseInt($env.AUDIT_REPLAY_WINDOW_S || '300', 10);\nif (Math.abs(nowSec - tsNum) > REPLAY_WINDOW_S) {\n  throw new Error('UNAUTHORIZED: timestamp outside replay window (' + REPLAY_WINDOW_S + 's)');\n}\n\nconst signedPayload = tsHeader + '.' + rawBody;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');\n\nif (providedSig.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expBuf = Buffer.from(expected, 'utf8');\nconst provBuf = Buffer.from(providedSig, 'utf8');\nif (!crypto.timingSafeEqual(expBuf, provBuf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [{ json: { signed: true, rawBody, headers, timestamp: tsNum } }];"
       },
       "id": "audit-pp-1-verify",
       "name": "Verify Webhook (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [440, 60],
+      "position": [
+        440,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -75,7 +90,10 @@
       "name": "Rate Limit (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [640, 60],
+      "position": [
+        640,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -86,18 +104,24 @@
       "name": "Idempotency Check (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [840, 60],
+      "position": [
+        840,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "// Build the audit row payload.\n// Hash chain (prev_hash + row_hash) is computed atomically in the Postgres Insert SQL\n// via WITH last AS (SELECT ... FOR UPDATE) + digest() from pgcrypto. We only emit the\n// payload + payload_hash + metadata fields here.\n\nconst crypto = require('crypto');\n\nconst items = $input.all();\nconst out = [];\nfor (const item of items) {\n  const j = item.json || {};\n  if (j.skipped) {\n    out.push(item);\n    continue;\n  }\n  const rawBody = j.rawBody || '';\n  const headers = j.headers || {};\n  const signed = !!j.signed;\n  const sourceIp = String(headers['x-forwarded-for'] || headers['x-real-ip'] || '').split(',')[0].trim() || null;\n  const sourceUserAgent = headers['user-agent'] || headers['User-Agent'] || null;\n  const eventType = headers['x-audit-event-type'] || headers['X-Audit-Event-Type'] || 'unknown';\n  const eventSource = headers['x-audit-source'] || headers['X-Audit-Source'] || 'unknown';\n  const payloadHash = crypto.createHash('sha256').update(rawBody, 'utf8').digest('hex');\n\n  out.push({ json: {\n    receivedAt: new Date().toISOString(),\n    eventType,\n    eventSource,\n    sourceIp,\n    sourceUserAgent: sourceUserAgent ? String(sourceUserAgent).slice(0, 500) : null,\n    signed,\n    payload: rawBody,\n    payloadHash,\n    dedupKey: j.dedupKey || null,\n  }});\n}\nreturn out;"
+        "jsCode": "// Build the audit row payload.\n// Hash chain (prev_hash + row_hash) is computed atomically in the Postgres Insert SQL.\n// Serialization is via pg_advisory_xact_lock in a MATERIALIZED CTE, with FOR UPDATE\n// kept as belt-and-suspenders. digest() from pgcrypto produces the row hash. We only\n// emit the payload + payload_hash + metadata fields here.\n\nconst crypto = require('crypto');\n\nconst items = $input.all();\nconst out = [];\nfor (const item of items) {\n  const j = item.json || {};\n  if (j.skipped) {\n    out.push(item);\n    continue;\n  }\n  const rawBody = j.rawBody || '';\n  const headers = j.headers || {};\n  const signed = !!j.signed;\n  const sourceIp = String(headers['x-forwarded-for'] || headers['x-real-ip'] || '').split(',')[0].trim() || null;\n  const sourceUserAgent = headers['user-agent'] || headers['User-Agent'] || null;\n  const eventType = headers['x-audit-event-type'] || headers['X-Audit-Event-Type'] || 'unknown';\n  const eventSource = headers['x-audit-source'] || headers['X-Audit-Source'] || 'unknown';\n  const payloadHash = crypto.createHash('sha256').update(rawBody, 'utf8').digest('hex');\n\n  out.push({ json: {\n    receivedAt: new Date().toISOString(),\n    eventType,\n    eventSource,\n    sourceIp,\n    sourceUserAgent: sourceUserAgent ? String(sourceUserAgent).slice(0, 500) : null,\n    signed,\n    payload: rawBody,\n    payloadHash,\n    dedupKey: j.dedupKey || null,\n  }});\n}\nreturn out;"
       },
       "id": "audit-3-normalize",
       "name": "Build Audit Row",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1040, 60]
+      "position": [
+        1040,
+        60
+      ]
     },
     {
       "parameters": {
@@ -107,12 +131,15 @@
       "name": "Forward Live Items Only",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1240, 60]
+      "position": [
+        1240,
+        60
+      ]
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH last AS (\n  SELECT row_hash AS prev_hash\n  FROM audit_log\n  ORDER BY id DESC\n  LIMIT 1\n  FOR UPDATE\n),\nseed AS (\n  SELECT\n    COALESCE((SELECT prev_hash FROM last), repeat('0', 64)) AS prev_hash,\n    $1::timestamptz AS received_at,\n    $2::text AS event_type,\n    $3::text AS event_source,\n    NULLIF($4, '')::text AS source_ip,\n    NULLIF($5, '')::text AS source_user_agent,\n    $6::boolean AS signed,\n    $7::text AS payload,\n    $8::text AS payload_hash,\n    NULLIF($9, '')::text AS dedup_key\n)\nINSERT INTO audit_log (received_at, event_type, event_source, source_ip, source_user_agent, signed, payload, payload_hash, prev_hash, row_hash, dedup_key)\nSELECT\n  received_at, event_type, event_source, source_ip, source_user_agent, signed, payload, payload_hash, prev_hash,\n  encode(\n    digest(\n      json_build_object(\n        'prevHash', prev_hash,\n        'payloadHash', payload_hash,\n        'signed', signed,\n        'sourceIp', source_ip,\n        'sourceUserAgent', source_user_agent,\n        'eventType', event_type,\n        'eventSource', event_source,\n        'receivedAt', to_char(received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MSZ')\n      )::text,\n      'sha256'\n    ),\n    'hex'\n  ) AS row_hash,\n  dedup_key\nFROM seed\nRETURNING id, prev_hash, row_hash;",
+        "query": "WITH advisory AS MATERIALIZED (\n  -- Serialize all inserts on the same chain key. Transaction-scoped\n  -- advisory lock is released on COMMIT/ROLLBACK. Using hashtext on a\n  -- chain identifier so multiple chains (e.g. per-tenant) do not block\n  -- each other if you ever need to shard.\n  SELECT pg_advisory_xact_lock(hashtext('audit_log_chain:default')) AS lock_acquired\n),\nlast AS MATERIALIZED (\n  -- CROSS JOIN advisory forces PostgreSQL to evaluate the advisory CTE\n  -- before scanning audit_log. With MATERIALIZED on advisory, the\n  -- ordering is guaranteed even on PG 12+ where CTEs are inlined by\n  -- default. FOR UPDATE stays as a belt-and-suspenders defense in case\n  -- a direct SQL writer bypasses this workflow.\n  SELECT row_hash AS prev_hash\n  FROM audit_log\n  CROSS JOIN advisory\n  ORDER BY id DESC\n  LIMIT 1\n  FOR UPDATE\n),\nseed AS (\n  SELECT\n    COALESCE((SELECT prev_hash FROM last), repeat('0', 64)) AS prev_hash,\n    $1::timestamptz AS received_at,\n    $2::text AS event_type,\n    $3::text AS event_source,\n    NULLIF($4, '')::text AS source_ip,\n    NULLIF($5, '')::text AS source_user_agent,\n    $6::boolean AS signed,\n    $7::text AS payload,\n    $8::text AS payload_hash,\n    NULLIF($9, '')::text AS dedup_key\n)\nINSERT INTO audit_log (received_at, event_type, event_source, source_ip, source_user_agent, signed, payload, payload_hash, prev_hash, row_hash, dedup_key)\nSELECT\n  received_at, event_type, event_source, source_ip, source_user_agent, signed, payload, payload_hash, prev_hash,\n  encode(\n    digest(\n      json_build_object(\n        'prevHash', prev_hash,\n        'payloadHash', payload_hash,\n        'signed', signed,\n        'sourceIp', source_ip,\n        'sourceUserAgent', source_user_agent,\n        'eventType', event_type,\n        'eventSource', event_source,\n        'receivedAt', to_char(received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MSZ')\n      )::text,\n      'sha256'\n    ),\n    'hex'\n  ) AS row_hash,\n  dedup_key\nFROM seed\nRETURNING id, prev_hash, row_hash;",
         "options": {
           "queryReplacement": "={{ $json.receivedAt }},{{ $json.eventType }},{{ $json.eventSource }},{{ $json.sourceIp }},{{ $json.sourceUserAgent }},{{ $json.signed }},{{ $json.payload }},{{ $json.payloadHash }},{{ $json.dedupKey }}"
         }
@@ -121,7 +148,10 @@
       "name": "Postgres Insert",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [1440, 60],
+      "position": [
+        1440,
+        60
+      ],
       "credentials": {
         "postgres": {
           "id": "REPLACE_ME",
@@ -142,7 +172,10 @@
       "name": "Respond to Client",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1640, 60]
+      "position": [
+        1640,
+        60
+      ]
     },
     {
       "parameters": {
@@ -152,7 +185,10 @@
       "name": "Error Fallback",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1240, 380]
+      "position": [
+        1240,
+        380
+      ]
     },
     {
       "parameters": {
@@ -167,7 +203,10 @@
       "name": "Slack Alert",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1440, 380],
+      "position": [
+        1440,
+        380
+      ],
       "onError": "continueRegularOutput"
     },
     {
@@ -182,39 +221,140 @@
       "name": "Error Respond",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1640, 380]
+      "position": [
+        1640,
+        380
+      ]
     }
   ],
   "connections": {
-    "Audit Webhook": { "main": [[{ "node": "Verify Webhook (opt-in)", "type": "main", "index": 0 }]] },
+    "Audit Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Webhook (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Verify Webhook (opt-in)": {
       "main": [
-        [{ "node": "Rate Limit (opt-in)", "type": "main", "index": 0 }],
-        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Rate Limit (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Rate Limit (opt-in)": {
       "main": [
-        [{ "node": "Idempotency Check (opt-in)", "type": "main", "index": 0 }],
-        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Idempotency Check (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Idempotency Check (opt-in)": {
       "main": [
-        [{ "node": "Build Audit Row", "type": "main", "index": 0 }],
-        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Build Audit Row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Build Audit Row": { "main": [[{ "node": "Forward Live Items Only", "type": "main", "index": 0 }]] },
-    "Forward Live Items Only": { "main": [[{ "node": "Postgres Insert", "type": "main", "index": 0 }]] },
+    "Build Audit Row": {
+      "main": [
+        [
+          {
+            "node": "Forward Live Items Only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Forward Live Items Only": {
+      "main": [
+        [
+          {
+            "node": "Postgres Insert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Postgres Insert": {
       "main": [
-        [{ "node": "Respond to Client", "type": "main", "index": 0 }],
-        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Respond to Client",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Error Fallback": { "main": [[{ "node": "Slack Alert", "type": "main", "index": 0 }]] },
-    "Slack Alert": { "main": [[{ "node": "Error Respond", "type": "main", "index": 0 }]] }
+    "Error Fallback": {
+      "main": [
+        [
+          {
+            "node": "Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Error Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   },
   "settings": {
     "executionOrder": "v1"

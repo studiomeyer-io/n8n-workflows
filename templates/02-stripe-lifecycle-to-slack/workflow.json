@@ -12,7 +12,10 @@
       "name": "Sticky Note - Intro",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, -100]
+      "position": [
+        -200,
+        -100
+      ]
     },
     {
       "parameters": {
@@ -25,7 +28,10 @@
       "name": "Sticky Note - Setup",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, 220]
+      "position": [
+        -200,
+        220
+      ]
     },
     {
       "parameters": {
@@ -40,48 +46,63 @@
       "name": "Stripe Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [240, 60],
+      "position": [
+        240,
+        60
+      ],
       "webhookId": "stripe-webhook"
     },
     {
       "parameters": {
-        "jsCode": "// Stripe-specific HMAC signature verification.\n// Stripe signs webhooks as `t=<timestamp>,v1=<hmac-sha256>`.\n// We verify the signature AND a 5-minute replay-window.\n//\n// Enable by setting STRIPE_WEBHOOK_SECRET (whsec_...) AND\n// WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n\nconst secret = $env.STRIPE_WEBHOOK_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.rawBody || '';\nconst sigHeader = (item.headers && (item.headers['stripe-signature'] || item.headers['Stripe-Signature'])) || '';\n\nif (!sigHeader || !rawBody) {\n  throw new Error('UNAUTHORIZED: missing Stripe-Signature or rawBody');\n}\n\n// Parse `t=<ts>,v1=<sig>[,v0=<...>]` shape\nconst pairs = String(sigHeader).split(',').map(p => p.trim());\nlet timestamp = null;\nconst v1Sigs = [];\nfor (const p of pairs) {\n  const [k, ...rest] = p.split('=');\n  const v = rest.join('=');\n  if (k === 't') timestamp = v;\n  else if (k === 'v1') v1Sigs.push(v);\n}\n\nif (!timestamp || v1Sigs.length === 0) {\n  throw new Error('UNAUTHORIZED: malformed Stripe-Signature header');\n}\n\n// Replay-window: reject events older than 5 minutes\nconst REPLAY_WINDOW_S = 300;\nconst tsNum = parseInt(timestamp, 10);\nif (!Number.isFinite(tsNum) || Math.abs(Math.floor(Date.now() / 1000) - tsNum) > REPLAY_WINDOW_S) {\n  throw new Error('UNAUTHORIZED: timestamp outside replay window');\n}\n\n// Compute expected v1 = HMAC-SHA256(secret, timestamp + '.' + rawBody)\nconst signedPayload = timestamp + '.' + rawBody;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');\nconst expectedBuf = Buffer.from(expected, 'utf8');\n\n// Constant-time compare against any of the v1 signatures (Stripe rotates)\nlet match = false;\nfor (const sig of v1Sigs) {\n  if (sig.length !== expected.length) continue;  // length-guard\n  const sigBuf = Buffer.from(sig, 'utf8');\n  if (crypto.timingSafeEqual(expectedBuf, sigBuf)) {\n    match = true;\n    break;\n  }\n}\n\nif (!match) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
+        "jsCode": "// Stripe-specific HMAC signature verification.\n// Stripe signs webhooks as `t=<timestamp>,v1=<hmac-sha256>`.\n// We verify the signature AND a 5-minute replay-window.\n//\n// Enable by setting STRIPE_WEBHOOK_SECRET (whsec_...) AND\n// WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n\nconst secret = $env.STRIPE_WEBHOOK_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.json.rawBody || '';\nconst sigHeader = (item.json.headers && (item.json.headers['stripe-signature'] || item.json.headers['Stripe-Signature'])) || '';\n\nif (!sigHeader || !rawBody) {\n  throw new Error('UNAUTHORIZED: missing Stripe-Signature or rawBody');\n}\n\n// Parse `t=<ts>,v1=<sig>[,v0=<...>]` shape\nconst pairs = String(sigHeader).split(',').map(p => p.trim());\nlet timestamp = null;\nconst v1Sigs = [];\nfor (const p of pairs) {\n  const [k, ...rest] = p.split('=');\n  const v = rest.join('=');\n  if (k === 't') timestamp = v;\n  else if (k === 'v1') v1Sigs.push(v);\n}\n\nif (!timestamp || v1Sigs.length === 0) {\n  throw new Error('UNAUTHORIZED: malformed Stripe-Signature header');\n}\n\n// Replay-window: reject events older than 5 minutes\nconst REPLAY_WINDOW_S = 300;\nconst tsNum = parseInt(timestamp, 10);\nif (!Number.isFinite(tsNum) || Math.abs(Math.floor(Date.now() / 1000) - tsNum) > REPLAY_WINDOW_S) {\n  throw new Error('UNAUTHORIZED: timestamp outside replay window');\n}\n\n// Compute expected v1 = HMAC-SHA256(secret, timestamp + '.' + rawBody)\nconst signedPayload = timestamp + '.' + rawBody;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');\nconst expectedBuf = Buffer.from(expected, 'utf8');\n\n// Constant-time compare against any of the v1 signatures (Stripe rotates)\nlet match = false;\nfor (const sig of v1Sigs) {\n  if (sig.length !== expected.length) continue;  // length-guard\n  const sigBuf = Buffer.from(sig, 'utf8');\n  if (crypto.timingSafeEqual(expectedBuf, sigBuf)) {\n    match = true;\n    break;\n  }\n}\n\nif (!match) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
       },
       "id": "stripe-pp-1-verify",
       "name": "Verify Stripe Signature (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [440, 60]
+      "position": [
+        440,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Per-customer-id sliding-window rate limit, opt-in.\n// 60 events per 5 minutes per customer. Defends against a leaked\n// signing-secret being used to spam events.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst event = ($input.first().body || {});\nconst customer = (event.data && event.data.object && event.data.object.customer) || 'unknown';\nconst key = String(customer);\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a,b) => (a[1][0]||0) - (b[1][0]||0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' events per ' + Math.round(WINDOW_MS / 60000) + ' minutes for customer ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];"
+        "jsCode": "// Per-customer-id sliding-window rate limit, opt-in.\n// 60 events per 5 minutes per customer. Defends against a leaked\n// signing-secret being used to spam events.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst event = ($input.first().json.body || {});\nconst customer = (event.data && event.data.object && event.data.object.customer) || 'unknown';\nconst key = String(customer);\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a,b) => (a[1][0]||0) - (b[1][0]||0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' events per ' + Math.round(WINDOW_MS / 60000) + ' minutes for customer ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];"
       },
       "id": "stripe-pp-2-ratelimit",
       "name": "Rate Limit (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [640, 60]
+      "position": [
+        640,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Idempotency on Stripe event.id. Stripe retries failed webhook deliveries\n// up to 3 days. Without dedup we send duplicate Slack messages per retry.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 24 * 60 * 60 * 1000;  // 24h, Stripe retries within 3d\nconst MAX_KEYS = 50000;\n\nconst event = ($input.first().body || {});\nconst eventId = event.id;\n\nif (!eventId) {\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a,b) => a[1] - b[1]).slice(0, 5000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[eventId]) {\n  return [{ json: { skipped: true, reason: 'duplicate', eventId } }];\n}\nseen[eventId] = now;\n\nreturn [$input.first()];"
+        "jsCode": "// Idempotency on Stripe event.id. Stripe retries failed webhook deliveries\n// up to 3 days. Without dedup we send duplicate Slack messages per retry.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 24 * 60 * 60 * 1000;  // 24h, Stripe retries within 3d\nconst MAX_KEYS = 50000;\n\nconst event = ($input.first().json.body || {});\nconst eventId = event.id;\n\nif (!eventId) {\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a,b) => a[1] - b[1]).slice(0, 5000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[eventId]) {\n  // Duplicate detected. Emit a sentinel item that the\n  // 'Skip If Duplicate' IF node routes to 'Respond Duplicate'\n  // (200 OK + { deduped: true }). Without that 200 the source\n  // provider would hold the HTTP connection until n8n's webhook\n  // timeout (default 30s) and mark delivery failed.\n  return [{ json: { skipped: true, reason: 'duplicate', dedupKey: String(eventId) } }];\n}\nseen[eventId] = now;\n\nreturn [$input.first()];"
       },
       "id": "stripe-pp-3-idempotency",
       "name": "Idempotency Check (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [840, 60]
+      "position": [
+        840,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Normalize the Stripe event into a stable shape for the Slack-message builder.\n// Pull customer, amount, plan, status across the supported event types.\n\nconst event = ($input.first().body || {});\nconst type = event.type || 'unknown';\nconst obj = (event.data && event.data.object) || {};\n\nconst customer = obj.customer || obj.customer_email || 'unknown';\nconst customerEmail = (obj.customer_details && obj.customer_details.email) || obj.customer_email || obj.receipt_email || null;\nconst customerName = (obj.customer_details && obj.customer_details.name) || null;\nconst country = (obj.customer_details && obj.customer_details.address && obj.customer_details.address.country) || null;\n\n// Amount in major currency (e.g. EUR, USD)\nconst amountMinor = obj.amount_total ?? obj.amount_due ?? obj.amount_paid ?? null;\nconst currency = (obj.currency || 'usd').toUpperCase();\nconst amount = amountMinor != null ? (amountMinor / 100).toFixed(2) : null;\n\nconst plan = (obj.metadata && obj.metadata.plan)\n  || (obj.items && obj.items.data && obj.items.data[0] && obj.items.data[0].price && obj.items.data[0].price.nickname)\n  || null;\n\nconst status = obj.status || obj.payment_status || null;\nconst subscriptionId = obj.subscription || (obj.id && obj.id.startsWith('sub_') ? obj.id : null);\n\nreturn [{\n  json: {\n    eventId: event.id,\n    eventType: type,\n    customer,\n    customerEmail,\n    customerName,\n    country,\n    amount,\n    currency,\n    plan,\n    status,\n    subscriptionId,\n    livemode: !!event.livemode,\n    receivedAt: new Date().toISOString(),\n    raw: event,\n  },\n}];"
+        "jsCode": "// Normalize the Stripe event into a stable shape for the Slack-message builder.\n// Pull customer, amount, plan, status across the supported event types.\n\nconst event = ($input.first().json.body || {});\nconst type = event.type || 'unknown';\nconst obj = (event.data && event.data.object) || {};\n\nconst customer = obj.customer || obj.customer_email || 'unknown';\nconst customerEmail = (obj.customer_details && obj.customer_details.email) || obj.customer_email || obj.receipt_email || null;\nconst customerName = (obj.customer_details && obj.customer_details.name) || null;\nconst country = (obj.customer_details && obj.customer_details.address && obj.customer_details.address.country) || null;\n\n// Amount in major currency (e.g. EUR, USD)\nconst amountMinor = obj.amount_total ?? obj.amount_due ?? obj.amount_paid ?? null;\nconst currency = (obj.currency || 'usd').toUpperCase();\nconst amount = amountMinor != null ? (amountMinor / 100).toFixed(2) : null;\n\nconst plan = (obj.metadata && obj.metadata.plan)\n  || (obj.items && obj.items.data && obj.items.data[0] && obj.items.data[0].price && obj.items.data[0].price.nickname)\n  || null;\n\nconst status = obj.status || obj.payment_status || null;\nconst subscriptionId = obj.subscription || (obj.id && obj.id.startsWith('sub_') ? obj.id : null);\n\nreturn [{\n  json: {\n    eventId: event.id,\n    eventType: type,\n    customer,\n    customerEmail,\n    customerName,\n    country,\n    amount,\n    currency,\n    plan,\n    status,\n    subscriptionId,\n    livemode: !!event.livemode,\n    receivedAt: new Date().toISOString(),\n    raw: event,\n  },\n}];"
       },
       "id": "stripe-1-normalize",
       "name": "Normalize Event",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1040, 60]
+      "position": [
+        1040,
+        60
+      ]
     },
     {
       "parameters": {
@@ -91,7 +112,10 @@
       "name": "Build Slack Message",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1240, 60]
+      "position": [
+        1240,
+        60
+      ]
     },
     {
       "parameters": {
@@ -106,7 +130,10 @@
       "name": "Slack Billing Notification",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1440, 60],
+      "position": [
+        1440,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -121,7 +148,10 @@
       "name": "Respond to Stripe",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1640, 60]
+      "position": [
+        1640,
+        60
+      ]
     },
     {
       "parameters": {
@@ -131,7 +161,10 @@
       "name": "Error Fallback",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1440, 360]
+      "position": [
+        1440,
+        360
+      ]
     },
     {
       "parameters": {
@@ -145,7 +178,10 @@
       "name": "Error Respond to Stripe",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1640, 360]
+      "position": [
+        1640,
+        360
+      ]
     },
     {
       "parameters": {
@@ -158,7 +194,69 @@
       "name": "Sticky Note - Production Patterns",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [840, -260]
+      "position": [
+        840,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-02-stripe-lifecycle-to-slack-skipped",
+              "leftValue": "={{ $json.skipped }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "02-str-if-skip-dup",
+      "name": "Skip If Duplicate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, deduped: true, reason: \"duplicate\" }) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "X-Dedup",
+                "value": "1"
+              }
+            ]
+          }
+        }
+      },
+      "id": "02-str-respond-duplicate",
+      "name": "Respond Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        -120
+      ]
     }
   ],
   "connections": {
@@ -199,7 +297,7 @@
       "main": [
         [
           {
-            "node": "Normalize Event",
+            "node": "Skip If Duplicate",
             "type": "main",
             "index": 0
           }
@@ -251,6 +349,24 @@
         [
           {
             "node": "Error Respond to Stripe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip If Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Respond Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize Event",
             "type": "main",
             "index": 0
           }

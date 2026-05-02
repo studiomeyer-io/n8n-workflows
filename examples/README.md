@@ -10,6 +10,8 @@ This folder ships realistic sample payloads for smoke-testing the templates with
 | `stripe-checkout-completed.json` | T02 Stripe Lifecycle to Slack | Stripe `checkout.session.completed` event |
 | `stripe-subscription-created.json` | T02 Stripe Lifecycle to Slack | Stripe `customer.subscription.created` event |
 | `slack-history-message.json` | T05 Slack Channel Daily Digest | Slack `conversations.history` API response |
+| `github-issue-opened.json` | T07 GitHub Issues Router | GitHub Issues webhook, `action=opened` |
+| `audit-event-signed.json` | T13 Webhook Audit Trail | Generic CRM event used by the audit ingest |
 
 All examples share one fictional customer (Maria Schmidt, +49 170 555 4444, Acme Mittelstand GmbH) so smoke-tests can chain across templates and watch one customer persist across channels.
 
@@ -54,7 +56,7 @@ curl -X POST https://your-n8n.example.com/webhook/lead-form \
   --data-binary @examples/form-submit.json
 ```
 
-The second response includes `{"skipped": true, "reason": "duplicate"}` in the n8n execution log.
+The second call halts cleanly inside the `Idempotency Check` node (`return []`). No downstream node runs, so no duplicate CRM deal is created. The webhook does NOT return 200 to the form provider for the duplicate. The provider may retry within its retry budget; each retry is also caught by the same dedup window. After the provider's retry budget is exhausted you may see a "delivery failed" notification on the provider side, which is the trade-off for not duplicating the side-effect.
 
 ### Stripe webhook (signed)
 
@@ -74,6 +76,63 @@ curl -X POST https://your-n8n.example.com/webhook/stripe \
 ```
 
 Expected: HTTP 200, Slack channel gets a `:white_check_mark: New paid customer: Maria Schmidt` message.
+
+### GitHub issue webhook (signed)
+
+GitHub signs webhooks with `X-Hub-Signature-256: sha256=<hex>`:
+
+```bash
+SECRET="your-github-webhook-secret"
+DELIVERY=$(uuidgen)
+BODY=$(cat examples/github-issue-opened.json)
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')
+
+curl -X POST https://your-n8n.example.com/webhook/github-issues \
+  -H 'Content-Type: application/json' \
+  -H 'X-GitHub-Event: issues' \
+  -H "X-GitHub-Delivery: $DELIVERY" \
+  -H "X-Hub-Signature-256: sha256=$SIG" \
+  --data "$BODY"
+```
+
+Expected: HTTP 200 if `action` is in `[opened, reopened, labeled]`. The Filter Event Type node returns `[]` (empty) for other actions, so no tracker row is created. The downstream tracker (Linear / Jira / ClickUp) creates one ticket and the workflow posts a follow-up comment back on the GitHub issue with the tracker URL.
+
+### T13 Webhook Audit Trail (signed)
+
+The audit ingest signs `<timestamp>.<rawBody>` (Stripe-style) and uses headers `x-audit-timestamp`, `x-audit-signature`, plus optional `x-audit-event-type` + `x-audit-source`:
+
+```bash
+SECRET="your-audit-signing-secret"
+TS=$(date +%s)
+BODY=$(cat examples/audit-event-signed.json)
+PAYLOAD="${TS}.${BODY}"
+SIG=$(printf '%s' "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')
+
+curl -X POST https://your-n8n.example.com/webhook/audit \
+  -H 'Content-Type: application/json' \
+  -H "x-audit-timestamp: $TS" \
+  -H "x-audit-signature: $SIG" \
+  -H 'x-audit-event-type: deal.create' \
+  -H 'x-audit-source: crm' \
+  -H "x-request-id: $(uuidgen)" \
+  --data "$BODY"
+```
+
+Expected: HTTP 200 with `{"ok": true, "id": <int>, "rowHash": "<hex>", "prevHash": "<hex>"}`. The hash chain is serialized via `pg_advisory_xact_lock(hashtext('audit_log_chain:default'))` so two concurrent inserts cannot read the same `prev_hash`. Replay the same `x-request-id` within 5 minutes and the second call halts inside `Idempotency Check`, no row is added to the chain.
+
+To verify the chain integrity from the database:
+
+```sql
+WITH chain AS (
+  SELECT id, prev_hash, row_hash,
+    LAG(row_hash) OVER (ORDER BY id) AS expected_prev
+  FROM audit_log
+)
+SELECT id FROM chain
+WHERE expected_prev IS NOT NULL AND expected_prev <> prev_hash;
+```
+
+Should return zero rows. Any row id returned indicates the chain was broken at that row, which means either: a direct INSERT bypassed the workflow, the row was tampered with, or there is a production bug to investigate.
 
 ### Slack `conversations.history` (no curl needed)
 

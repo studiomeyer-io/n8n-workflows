@@ -12,7 +12,10 @@
       "name": "Sticky Note - Intro",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, -100]
+      "position": [
+        -200,
+        -100
+      ]
     },
     {
       "parameters": {
@@ -25,7 +28,10 @@
       "name": "Sticky Note - Setup",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, 240]
+      "position": [
+        -200,
+        240
+      ]
     },
     {
       "parameters": {
@@ -38,7 +44,10 @@
       "name": "Sticky Note - Production Patterns",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [840, -260]
+      "position": [
+        840,
+        -260
+      ]
     },
     {
       "parameters": {
@@ -53,48 +62,63 @@
       "name": "CSV Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [240, 60],
+      "position": [
+        240,
+        60
+      ],
       "webhookId": "csv-validate"
     },
     {
       "parameters": {
-        "jsCode": "// HMAC-SHA256 signature verification on raw body, opt-in, with replay-window check.\n// Headers required when WEBHOOK_INTEGRITY_CHECK_ENABLED=1:\n//   x-csv-signature: <hex-hmac-sha256(timestamp + '.' + rawBody)>\n//   x-csv-timestamp: <unix-seconds>\n// Enable by setting CSV_UPLOAD_SIGNING_SECRET + WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n//\n// Replay-window default 5 min. Override with CSV_UPLOAD_REPLAY_WINDOW_S.\n\nconst secret = $env.CSV_UPLOAD_SIGNING_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.rawBody || (typeof item.body === 'string' ? item.body : JSON.stringify(item.body || {}));\nconst headers = item.headers || {};\nconst providedSig = headers['x-csv-signature'] || headers['X-CSV-Signature'];\nconst tsHeader = headers['x-csv-timestamp'] || headers['X-CSV-Timestamp'];\n\nif (!providedSig || typeof providedSig !== 'string') {\n  throw new Error('UNAUTHORIZED: missing x-csv-signature header');\n}\nif (!tsHeader || typeof tsHeader !== 'string') {\n  throw new Error('UNAUTHORIZED: missing x-csv-timestamp header (replay protection)');\n}\n\nconst tsNum = parseInt(tsHeader, 10);\nif (!Number.isFinite(tsNum)) {\n  throw new Error('UNAUTHORIZED: invalid x-csv-timestamp value');\n}\nconst nowSec = Math.floor(Date.now() / 1000);\nconst REPLAY_WINDOW_S = parseInt($env.CSV_UPLOAD_REPLAY_WINDOW_S || '300', 10);\nif (Math.abs(nowSec - tsNum) > REPLAY_WINDOW_S) {\n  throw new Error('UNAUTHORIZED: timestamp outside replay window (' + REPLAY_WINDOW_S + 's)');\n}\n\nconst signedPayload = tsHeader + '.' + rawBody;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');\n\nif (providedSig.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expBuf = Buffer.from(expected, 'utf8');\nconst provBuf = Buffer.from(providedSig, 'utf8');\nif (!crypto.timingSafeEqual(expBuf, provBuf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
+        "jsCode": "// HMAC-SHA256 signature verification on raw body, opt-in, with replay-window check.\n// Headers required when WEBHOOK_INTEGRITY_CHECK_ENABLED=1:\n//   x-csv-signature: <hex-hmac-sha256(timestamp + '.' + rawBody)>\n//   x-csv-timestamp: <unix-seconds>\n// Enable by setting CSV_UPLOAD_SIGNING_SECRET + WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n//\n// Replay-window default 5 min. Override with CSV_UPLOAD_REPLAY_WINDOW_S.\n\nconst secret = $env.CSV_UPLOAD_SIGNING_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.json.rawBody || (typeof item.json.body === 'string' ? item.json.body : JSON.stringify(item.json.body || {}));\nconst headers = item.json.headers || {};\nconst providedSig = headers['x-csv-signature'] || headers['X-CSV-Signature'];\nconst tsHeader = headers['x-csv-timestamp'] || headers['X-CSV-Timestamp'];\n\nif (!providedSig || typeof providedSig !== 'string') {\n  throw new Error('UNAUTHORIZED: missing x-csv-signature header');\n}\nif (!tsHeader || typeof tsHeader !== 'string') {\n  throw new Error('UNAUTHORIZED: missing x-csv-timestamp header (replay protection)');\n}\n\nconst tsNum = parseInt(tsHeader, 10);\nif (!Number.isFinite(tsNum)) {\n  throw new Error('UNAUTHORIZED: invalid x-csv-timestamp value');\n}\nconst nowSec = Math.floor(Date.now() / 1000);\nconst REPLAY_WINDOW_S = parseInt($env.CSV_UPLOAD_REPLAY_WINDOW_S || '300', 10);\nif (Math.abs(nowSec - tsNum) > REPLAY_WINDOW_S) {\n  throw new Error('UNAUTHORIZED: timestamp outside replay window (' + REPLAY_WINDOW_S + 's)');\n}\n\nconst signedPayload = tsHeader + '.' + rawBody;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');\n\nif (providedSig.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expBuf = Buffer.from(expected, 'utf8');\nconst provBuf = Buffer.from(providedSig, 'utf8');\nif (!crypto.timingSafeEqual(expBuf, provBuf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
       },
       "id": "csv-pp-1-verify",
       "name": "Verify Webhook (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [440, 60]
+      "position": [
+        440,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Per-IP sliding-window rate limit, opt-in.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst headers = item.headers || {};\nconst rawIp = headers['x-forwarded-for'] || headers['x-real-ip'] || 'unknown';\nconst key = String(rawIp).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];"
+        "jsCode": "// Per-IP sliding-window rate limit, opt-in.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst rawIp = headers['x-forwarded-for'] || headers['x-real-ip'] || 'unknown';\nconst key = String(rawIp).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];"
       },
       "id": "csv-pp-2-ratelimit",
       "name": "Rate Limit (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [640, 60]
+      "position": [
+        640,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// 5-minute idempotency window on sha256(rawBody), opt-in.\n\nconst crypto = require('crypto');\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst rawBody = item.rawBody || (typeof item.body === 'string' ? item.body : JSON.stringify(item.body || {}));\nconst dedupKey = crypto.createHash('sha256').update(rawBody, 'utf8').digest('hex').slice(0, 32);\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 500);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[dedupKey]) {\n  return [{ json: { skipped: true, reason: 'duplicate', dedupKey } }];\n}\nseen[dedupKey] = now;\n\nreturn [$input.first()];\n\n// Redis variant for clustered n8n:\n// const result = await redis.set('csv-idem:' + dedupKey, '1', 'EX', 300, 'NX');\n// if (result === null) return [];"
+        "jsCode": "// 5-minute idempotency window on sha256(rawBody), opt-in.\n\nconst crypto = require('crypto');\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst rawBody = item.json.rawBody || (typeof item.json.body === 'string' ? item.json.body : JSON.stringify(item.json.body || {}));\nconst dedupKey = crypto.createHash('sha256').update(rawBody, 'utf8').digest('hex').slice(0, 32);\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 500);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[dedupKey]) {\n  // Duplicate detected. Emit a sentinel item that the\n  // 'Skip If Duplicate' IF node routes to 'Respond Duplicate'\n  // (200 OK + { deduped: true }). Without that 200 the source\n  // provider would hold the HTTP connection until n8n's webhook\n  // timeout (default 30s) and mark delivery failed.\n  return [{ json: { skipped: true, reason: 'duplicate', dedupKey: String(dedupKey) } }];\n}\nseen[dedupKey] = now;\n\nreturn [$input.first()];\n\n// Redis variant for clustered n8n:\n// const result = await redis.set('csv-idem:' + dedupKey, '1', 'EX', 300, 'NX');\n// if (result === null) return [];"
       },
       "id": "csv-pp-3-idempotency",
       "name": "Idempotency Check (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [840, 60]
+      "position": [
+        840,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Quote-aware CSV parser. Handles quoted fields with embedded commas, embedded newlines,\n// escaped quotes (RFC 4180). BOM stripping. Configurable delimiter.\n//\n// Hard MAX_BODY_BYTES cap as defense against accidental giant uploads.\n\nconst item = $input.first();\nconst rawBody = item.rawBody || (typeof item.body === 'string' ? item.body : '');\nif (typeof rawBody !== 'string') {\n  throw new Error('CSV body must be a string. Set Webhook node Options -> Raw Body = true.');\n}\n\nconst MAX_BODY_BYTES = parseInt($env.MAX_BODY_BYTES || '5242880', 10);\nif (Buffer.byteLength(rawBody, 'utf8') > MAX_BODY_BYTES) {\n  throw new Error('PAYLOAD_TOO_LARGE: body exceeds MAX_BODY_BYTES=' + MAX_BODY_BYTES);\n}\n\nconst MAX_ROWS = parseInt($env.MAX_ROWS || '10000', 10);\nconst delimRaw = $env.CSV_DELIMITER || ',';\nconst delim = delimRaw === '\\\\t' ? '\\t' : delimRaw;\n\n// Strip BOM\nlet text = rawBody.charCodeAt(0) === 0xFEFF ? rawBody.slice(1) : rawBody;\n\n// Quote-aware tokenizer\nconst rows = [];\nlet field = '';\nlet row = [];\nlet inQuotes = false;\nfor (let i = 0; i < text.length; i++) {\n  const c = text[i];\n  if (inQuotes) {\n    if (c === '\"') {\n      if (text[i + 1] === '\"') { field += '\"'; i++; }\n      else { inQuotes = false; }\n    } else {\n      field += c;\n    }\n  } else {\n    if (c === '\"') { inQuotes = true; }\n    else if (c === delim) { row.push(field); field = ''; }\n    else if (c === '\\r') { /* skip CR */ }\n    else if (c === '\\n') { row.push(field); rows.push(row); row = []; field = ''; if (rows.length > MAX_ROWS + 1) break; }\n    else { field += c; }\n  }\n}\n// Tail handling\nif (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }\n\nif (rows.length === 0) throw new Error('CSV is empty');\nif (rows.length - 1 > MAX_ROWS) throw new Error('TOO_MANY_ROWS: limit is ' + MAX_ROWS);\n\nconst headers = rows[0].map(h => String(h || '').trim());\nconst dataRows = rows.slice(1);\n\nconst out = [];\nfor (let r = 0; r < dataRows.length; r++) {\n  const cells = dataRows[r];\n  if (cells.length === 1 && cells[0] === '') continue; // skip blank line\n  const obj = {};\n  for (let c = 0; c < headers.length; c++) {\n    obj[headers[c]] = cells[c] != null ? cells[c] : '';\n  }\n  out.push({ json: { rowNumber: r + 2, raw: obj } }); // +2 because header is row 1, data starts at row 2\n}\nreturn out;"
+        "jsCode": "// Quote-aware CSV parser. Handles quoted fields with embedded commas, embedded newlines,\n// escaped quotes (RFC 4180). BOM stripping. Configurable delimiter.\n//\n// Hard MAX_BODY_BYTES cap as defense against accidental giant uploads.\n\nconst item = $input.first();\nconst rawBody = item.json.rawBody || (typeof item.json.body === 'string' ? item.json.body : '');\nif (typeof rawBody !== 'string') {\n  throw new Error('CSV body must be a string. Set Webhook node Options -> Raw Body = true.');\n}\n\nconst MAX_BODY_BYTES = parseInt($env.MAX_BODY_BYTES || '5242880', 10);\nif (Buffer.byteLength(rawBody, 'utf8') > MAX_BODY_BYTES) {\n  throw new Error('PAYLOAD_TOO_LARGE: body exceeds MAX_BODY_BYTES=' + MAX_BODY_BYTES);\n}\n\nconst MAX_ROWS = parseInt($env.MAX_ROWS || '10000', 10);\nconst delimRaw = $env.CSV_DELIMITER || ',';\nconst delim = delimRaw === '\\\\t' ? '\\t' : delimRaw;\n\n// Strip BOM\nlet text = rawBody.charCodeAt(0) === 0xFEFF ? rawBody.slice(1) : rawBody;\n\n// Quote-aware tokenizer\nconst rows = [];\nlet field = '';\nlet row = [];\nlet inQuotes = false;\nfor (let i = 0; i < text.length; i++) {\n  const c = text[i];\n  if (inQuotes) {\n    if (c === '\"') {\n      if (text[i + 1] === '\"') { field += '\"'; i++; }\n      else { inQuotes = false; }\n    } else {\n      field += c;\n    }\n  } else {\n    if (c === '\"') { inQuotes = true; }\n    else if (c === delim) { row.push(field); field = ''; }\n    else if (c === '\\r') { /* skip CR */ }\n    else if (c === '\\n') { row.push(field); rows.push(row); row = []; field = ''; if (rows.length > MAX_ROWS + 1) break; }\n    else { field += c; }\n  }\n}\n// Tail handling\nif (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }\n\nif (rows.length === 0) throw new Error('CSV is empty');\nif (rows.length - 1 > MAX_ROWS) throw new Error('TOO_MANY_ROWS: limit is ' + MAX_ROWS);\n\nconst headers = rows[0].map(h => String(h || '').trim());\nconst dataRows = rows.slice(1);\n\nconst out = [];\nfor (let r = 0; r < dataRows.length; r++) {\n  const cells = dataRows[r];\n  if (cells.length === 1 && cells[0] === '') continue; // skip blank line\n  const obj = {};\n  for (let c = 0; c < headers.length; c++) {\n    obj[headers[c]] = cells[c] != null ? cells[c] : '';\n  }\n  out.push({ json: { rowNumber: r + 2, raw: obj } }); // +2 because header is row 1, data starts at row 2\n}\nreturn out;"
       },
       "id": "csv-2-parse",
       "name": "Parse CSV",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1040, 60],
+      "position": [
+        1040,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -105,7 +129,10 @@
       "name": "Validate + Sanitize Rows",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1240, 60]
+      "position": [
+        1240,
+        60
+      ]
     },
     {
       "parameters": {
@@ -115,7 +142,10 @@
       "name": "Build Report",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1440, 60]
+      "position": [
+        1440,
+        60
+      ]
     },
     {
       "parameters": {
@@ -130,7 +160,10 @@
       "name": "Slack Summary",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1640, 60],
+      "position": [
+        1640,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -145,7 +178,10 @@
       "name": "Respond to Client",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1840, 60]
+      "position": [
+        1840,
+        60
+      ]
     },
     {
       "parameters": {
@@ -155,7 +191,10 @@
       "name": "Error Fallback",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1640, 380]
+      "position": [
+        1640,
+        380
+      ]
     },
     {
       "parameters": {
@@ -169,29 +208,203 @@
       "name": "Error Respond to Client",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1840, 380]
+      "position": [
+        1840,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-10-csv-bulk-validator-skipped",
+              "leftValue": "={{ $json.skipped }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "10-csv-if-skip-dup",
+      "name": "Skip If Duplicate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, deduped: true, reason: \"duplicate\" }) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "X-Dedup",
+                "value": "1"
+              }
+            ]
+          }
+        }
+      },
+      "id": "10-csv-respond-duplicate",
+      "name": "Respond Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        -120
+      ]
     }
   ],
   "connections": {
-    "CSV Webhook": { "main": [[{ "node": "Verify Webhook (opt-in)", "type": "main", "index": 0 }]] },
-    "Verify Webhook (opt-in)": { "main": [[{ "node": "Rate Limit (opt-in)", "type": "main", "index": 0 }]] },
-    "Rate Limit (opt-in)": { "main": [[{ "node": "Idempotency Check (opt-in)", "type": "main", "index": 0 }]] },
-    "Idempotency Check (opt-in)": { "main": [[{ "node": "Parse CSV", "type": "main", "index": 0 }]] },
+    "CSV Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Webhook (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Webhook (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Rate Limit (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate Limit (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Skip If Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Parse CSV": {
       "main": [
-        [{ "node": "Validate + Sanitize Rows", "type": "main", "index": 0 }],
-        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Validate + Sanitize Rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Validate + Sanitize Rows": { "main": [[{ "node": "Build Report", "type": "main", "index": 0 }]] },
-    "Build Report": { "main": [[{ "node": "Slack Summary", "type": "main", "index": 0 }]] },
+    "Validate + Sanitize Rows": {
+      "main": [
+        [
+          {
+            "node": "Build Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Report": {
+      "main": [
+        [
+          {
+            "node": "Slack Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Slack Summary": {
       "main": [
-        [{ "node": "Respond to Client", "type": "main", "index": 0 }],
-        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Respond to Client",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Error Fallback": { "main": [[{ "node": "Error Respond to Client", "type": "main", "index": 0 }]] }
+    "Error Fallback": {
+      "main": [
+        [
+          {
+            "node": "Error Respond to Client",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip If Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Respond Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parse CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   },
   "settings": {
     "executionOrder": "v1"

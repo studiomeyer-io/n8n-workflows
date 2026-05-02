@@ -12,7 +12,10 @@
       "name": "Sticky Note - Intro",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, -100]
+      "position": [
+        -200,
+        -100
+      ]
     },
     {
       "parameters": {
@@ -25,7 +28,10 @@
       "name": "Sticky Note - Setup",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, 220]
+      "position": [
+        -200,
+        220
+      ]
     },
     {
       "parameters": {
@@ -40,48 +46,63 @@
       "name": "Form Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [240, 60],
+      "position": [
+        240,
+        60
+      ],
       "webhookId": "lead-form"
     },
     {
       "parameters": {
-        "jsCode": "// HMAC-SHA256 signature verification, opt-in.\n// Enable by setting LEAD_FORM_SIGNING_SECRET in your n8n env\n// AND configuring the same secret in your form provider.\n// Pass-through when unset.\n\nconst secret = $env.LEAD_FORM_SIGNING_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  // Disabled by design, let the request through.\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.rawBody || (typeof item.body === 'string' ? item.body : JSON.stringify(item.body || {}));\nconst providedSig = item.headers && (item.headers['x-form-signature'] || item.headers['X-Form-Signature']);\n\nif (!providedSig) {\n  throw new Error('UNAUTHORIZED: missing x-form-signature header');\n}\n\nconst expected = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex');\n\n// Length-guard before constant-time compare. Without this, a 1-char\n// signature throws RangeError = free DoS on the verifier.\nif (providedSig.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expectedBuf = Buffer.from(expected, 'utf8');\nconst providedBuf = Buffer.from(providedSig, 'utf8');\n\nif (!crypto.timingSafeEqual(expectedBuf, providedBuf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
+        "jsCode": "// HMAC-SHA256 signature verification, opt-in.\n// Enable by setting LEAD_FORM_SIGNING_SECRET in your n8n env\n// AND configuring the same secret in your form provider.\n// Pass-through when unset.\n\nconst secret = $env.LEAD_FORM_SIGNING_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  // Disabled by design, let the request through.\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.json.rawBody || (typeof item.json.body === 'string' ? item.json.body : JSON.stringify(item.json.body || {}));\nconst providedSig = item.json.headers && (item.json.headers['x-form-signature'] || item.json.headers['X-Form-Signature']);\n\nif (!providedSig) {\n  throw new Error('UNAUTHORIZED: missing x-form-signature header');\n}\n\nconst expected = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex');\n\n// Length-guard before constant-time compare. Without this, a 1-char\n// signature throws RangeError = free DoS on the verifier.\nif (providedSig.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expectedBuf = Buffer.from(expected, 'utf8');\nconst providedBuf = Buffer.from(providedSig, 'utf8');\n\nif (!crypto.timingSafeEqual(expectedBuf, providedBuf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
       },
       "id": "form-pp-1-verify",
       "name": "Verify Webhook (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [440, 60]
+      "position": [
+        440,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Per-IP sliding-window rate limit, opt-in.\n// Enable by setting RATE_LIMIT_ENABLED=1 in your n8n env.\n// 60 requests per 5 minutes per IP. Adjust below.\n//\n// For real production loads put rate limiting on a reverse proxy\n// (Nginx limit_req_zone, Cloudflare WAF, Traefik). This node is\n// defense-in-depth, not the primary control.\n//\n// $getWorkflowStaticData is per-instance and not cluster-aware.\n// Multi-worker n8n: replace with Redis INCR + EXPIRE (snippet below).\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst ip = (item.headers && (item.headers['x-forwarded-for'] || item.headers['x-real-ip'])) || 'unknown';\nconst key = String(ip).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\n// Evict expired entries\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\n// Cap map size\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a,b) => (a[1][0]||0) - (b[1][0]||0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];\n\n// Redis variant for clustered n8n:\n// const Redis = require('ioredis');\n// const redis = new Redis(process.env.REDIS_URL);\n// const cnt = await redis.incr('rl:' + key);\n// if (cnt === 1) await redis.expire('rl:' + key, 300);\n// await redis.quit();\n// if (cnt > LIMIT) throw new Error('RATE_LIMIT_EXCEEDED');"
+        "jsCode": "// Per-IP sliding-window rate limit, opt-in.\n// Enable by setting RATE_LIMIT_ENABLED=1 in your n8n env.\n// 60 requests per 5 minutes per IP. Adjust below.\n//\n// For real production loads put rate limiting on a reverse proxy\n// (Nginx limit_req_zone, Cloudflare WAF, Traefik). This node is\n// defense-in-depth, not the primary control.\n//\n// $getWorkflowStaticData is per-instance and not cluster-aware.\n// Multi-worker n8n: replace with Redis INCR + EXPIRE (snippet below).\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst ip = (item.json.headers && (item.json.headers['x-forwarded-for'] || item.json.headers['x-real-ip'])) || 'unknown';\nconst key = String(ip).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\n// Evict expired entries\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\n// Cap map size\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a,b) => (a[1][0]||0) - (b[1][0]||0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];\n\n// Redis variant for clustered n8n:\n// const Redis = require('ioredis');\n// const redis = new Redis(process.env.REDIS_URL);\n// const cnt = await redis.incr('rl:' + key);\n// if (cnt === 1) await redis.expire('rl:' + key, 300);\n// await redis.quit();\n// if (cnt > LIMIT) throw new Error('RATE_LIMIT_EXCEEDED');"
       },
       "id": "form-pp-2-ratelimit",
       "name": "Rate Limit (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [640, 60]
+      "position": [
+        640,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// 5-minute idempotency window on form submission ID, opt-in.\n// Enable by setting IDEMPOTENCY_ENABLED=1.\n// Form providers retry on 5xx. Without dedup we create the lead twice in CRM.\n//\n// Replace the in-memory block with Redis SET NX EX 300 for clustered n8n.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 10000;\n\nconst item = $input.first();\nconst body = item.body || {};\n// Idempotency key: provider-supplied submission ID, fallback to email + minute-bucketed timestamp\nconst submissionId = body.submission_id || body.id;\nconst email = (body.email || '').toLowerCase();\nconst minuteBucket = Math.floor(Date.now() / 60000);\nconst idempotencyKey = submissionId || (email && (email + ':' + minuteBucket));\n\nif (!idempotencyKey) {\n  // No deduplicable key, let it through\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\n// Evict expired\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\n// Cap size\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a,b) => a[1] - b[1]).slice(0, 1000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[idempotencyKey]) {\n  return [{ json: { skipped: true, reason: 'duplicate', idempotencyKey } }];\n}\nseen[idempotencyKey] = now;\n\nreturn [$input.first()];\n\n// Redis variant:\n// const result = await redis.set('idem:' + idempotencyKey, '1', 'EX', 300, 'NX');\n// if (result === null) return [];"
+        "jsCode": "// 5-minute idempotency window on form submission ID, opt-in.\n// Enable by setting IDEMPOTENCY_ENABLED=1.\n// Form providers retry on 5xx. Without dedup we create the lead twice in CRM.\n//\n// Replace the in-memory block with Redis SET NX EX 300 for clustered n8n.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 10000;\n\nconst item = $input.first();\nconst body = item.json.body || {};\n// Idempotency key: provider-supplied submission ID, fallback to email + minute-bucketed timestamp\nconst submissionId = body.submission_id || body.id;\nconst email = (body.email || '').toLowerCase();\nconst minuteBucket = Math.floor(Date.now() / 60000);\nconst idempotencyKey = submissionId || (email && (email + ':' + minuteBucket));\n\nif (!idempotencyKey) {\n  // No deduplicable key, let it through\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\n// Evict expired\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\n// Cap size\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a,b) => a[1] - b[1]).slice(0, 1000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[idempotencyKey]) {\n  // Duplicate detected. Emit a sentinel item that the\n  // 'Skip If Duplicate' IF node routes to 'Respond Duplicate'\n  // (200 OK + { deduped: true }). Without that 200 the source\n  // provider would hold the HTTP connection until n8n's webhook\n  // timeout (default 30s) and mark delivery failed.\n  return [{ json: { skipped: true, reason: 'duplicate', dedupKey: String(idempotencyKey) } }];\n}\nseen[idempotencyKey] = now;\n\nreturn [$input.first()];\n\n// Redis variant:\n// const result = await redis.set('idem:' + idempotencyKey, '1', 'EX', 300, 'NX');\n// if (result === null) return [];"
       },
       "id": "form-pp-3-idempotency",
       "name": "Idempotency Check (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [840, 60]
+      "position": [
+        840,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Normalize the form payload into a stable schema regardless of provider\n// (Webflow / Tally / Typeform / custom HTML). Map common field names.\n\nconst body = ($input.first().body || {});\n\nconst pick = (...keys) => {\n  for (const k of keys) {\n    if (body[k] != null && String(body[k]).trim() !== '') return String(body[k]).trim();\n  }\n  return null;\n};\n\nconst submissionId = pick('submission_id', 'id', 'submissionId') || ('lead-' + Date.now());\nconst email = (pick('email', 'email_address', 'EmailAddress') || '').toLowerCase();\nconst name = pick('name', 'full_name', 'fullName', 'first_name') || 'Unknown';\nconst company = pick('company', 'organization', 'company_name', 'org') || null;\nconst phone = pick('phone', 'phoneNumber', 'phone_number') || null;\n\n// BANT-aligned input fields. Form-provider-specific names mapped here.\nconst budget = pick('budget', 'budget_range', 'monthly_budget') || null;\nconst authority = pick('authority', 'role', 'job_title', 'title') || null;\nconst need = pick('need', 'pain_point', 'problem', 'use_case') || null;\nconst timeline = pick('timeline', 'when', 'urgency', 'start_date') || null;\nconst intent = pick('intent', 'reason', 'message', 'notes') || null;\nconst source = pick('source', 'utm_source', 'referrer') || 'direct';\n\nreturn [{\n  json: {\n    submissionId,\n    email,\n    name,\n    company,\n    phone,\n    bant: { budget, authority, need, timeline, intent },\n    source,\n    receivedAt: new Date().toISOString(),\n  },\n}];"
+        "jsCode": "// Normalize the form payload into a stable schema regardless of provider\n// (Webflow / Tally / Typeform / custom HTML). Map common field names.\n\nconst body = ($input.first().json.body || {});\n\nconst pick = (...keys) => {\n  for (const k of keys) {\n    if (body[k] != null && String(body[k]).trim() !== '') return String(body[k]).trim();\n  }\n  return null;\n};\n\nconst submissionId = pick('submission_id', 'id', 'submissionId') || ('lead-' + Date.now());\nconst email = (pick('email', 'email_address', 'EmailAddress') || '').toLowerCase();\nconst name = pick('name', 'full_name', 'fullName', 'first_name') || 'Unknown';\nconst company = pick('company', 'organization', 'company_name', 'org') || null;\nconst phone = pick('phone', 'phoneNumber', 'phone_number') || null;\n\n// BANT-aligned input fields. Form-provider-specific names mapped here.\nconst budget = pick('budget', 'budget_range', 'monthly_budget') || null;\nconst authority = pick('authority', 'role', 'job_title', 'title') || null;\nconst need = pick('need', 'pain_point', 'problem', 'use_case') || null;\nconst timeline = pick('timeline', 'when', 'urgency', 'start_date') || null;\nconst intent = pick('intent', 'reason', 'message', 'notes') || null;\nconst source = pick('source', 'utm_source', 'referrer') || 'direct';\n\nreturn [{\n  json: {\n    submissionId,\n    email,\n    name,\n    company,\n    phone,\n    bant: { budget, authority, need, timeline, intent },\n    source,\n    receivedAt: new Date().toISOString(),\n  },\n}];"
       },
       "id": "form-1-normalize",
       "name": "Normalize Payload",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1040, 60]
+      "position": [
+        1040,
+        60
+      ]
     },
     {
       "parameters": {
@@ -91,7 +112,10 @@
       "name": "BANT Score",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1240, 60]
+      "position": [
+        1240,
+        60
+      ]
     },
     {
       "parameters": {
@@ -101,7 +125,10 @@
       "name": "Set CRM Target",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1440, 60]
+      "position": [
+        1440,
+        60
+      ]
     },
     {
       "parameters": {
@@ -180,7 +207,10 @@
       "name": "Route by CRM",
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.2,
-      "position": [1640, 60]
+      "position": [
+        1640,
+        60
+      ]
     },
     {
       "parameters": {
@@ -226,7 +256,10 @@
       "name": "Pipedrive Create Deal",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1840, -100],
+      "position": [
+        1840,
+        -100
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -255,7 +288,10 @@
       "name": "HubSpot Create Deal",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1840, 60],
+      "position": [
+        1840,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -284,7 +320,10 @@
       "name": "Salesforce Create Deal",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1840, 220],
+      "position": [
+        1840,
+        220
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -295,7 +334,10 @@
       "name": "Normalize CRM Output",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2040, 60]
+      "position": [
+        2040,
+        60
+      ]
     },
     {
       "parameters": {
@@ -310,7 +352,10 @@
       "name": "Slack Ops Notification",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2240, 60],
+      "position": [
+        2240,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -325,7 +370,10 @@
       "name": "Respond to Form",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [2440, 60]
+      "position": [
+        2440,
+        60
+      ]
     },
     {
       "parameters": {
@@ -335,7 +383,10 @@
       "name": "Error Fallback",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2240, 380]
+      "position": [
+        2240,
+        380
+      ]
     },
     {
       "parameters": {
@@ -350,7 +401,10 @@
       "name": "Error Slack Alert",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2440, 380],
+      "position": [
+        2440,
+        380
+      ],
       "onError": "continueRegularOutput"
     },
     {
@@ -365,7 +419,10 @@
       "name": "Error Respond to Form",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [2640, 380]
+      "position": [
+        2640,
+        380
+      ]
     },
     {
       "parameters": {
@@ -378,7 +435,69 @@
       "name": "Sticky Note - Production Patterns",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [840, -260]
+      "position": [
+        840,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-01-form-to-crm-lead-router-skipped",
+              "leftValue": "={{ $json.skipped }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "01-for-if-skip-dup",
+      "name": "Skip If Duplicate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, deduped: true, reason: \"duplicate\" }) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "X-Dedup",
+                "value": "1"
+              }
+            ]
+          }
+        }
+      },
+      "id": "01-for-respond-duplicate",
+      "name": "Respond Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        -120
+      ]
     }
   ],
   "connections": {
@@ -419,7 +538,7 @@
       "main": [
         [
           {
-            "node": "Normalize Payload",
+            "node": "Skip If Duplicate",
             "type": "main",
             "index": 0
           }
@@ -590,6 +709,24 @@
         [
           {
             "node": "Error Respond to Form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip If Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Respond Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize Payload",
             "type": "main",
             "index": 0
           }

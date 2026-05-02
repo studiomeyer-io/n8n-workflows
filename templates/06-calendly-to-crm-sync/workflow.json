@@ -12,7 +12,10 @@
       "name": "Sticky Note - Intro",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, -100]
+      "position": [
+        -200,
+        -100
+      ]
     },
     {
       "parameters": {
@@ -25,7 +28,10 @@
       "name": "Sticky Note - Setup",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, 240]
+      "position": [
+        -200,
+        240
+      ]
     },
     {
       "parameters": {
@@ -38,7 +44,10 @@
       "name": "Sticky Note - Production Patterns",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [840, -260]
+      "position": [
+        840,
+        -260
+      ]
     },
     {
       "parameters": {
@@ -53,48 +62,63 @@
       "name": "Calendly Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [240, 60],
+      "position": [
+        240,
+        60
+      ],
       "webhookId": "calendly-webhook"
     },
     {
       "parameters": {
-        "jsCode": "// Calendly v2 HMAC signature verification, opt-in.\n// Header: Calendly-Webhook-Signature with format `t=<unix-ts>,v1=<hmac-sha256>`\n// HMAC payload: `<timestamp>.<rawBody>` (Stripe-like, not just rawBody).\n//\n// Enable by setting CALENDLY_SIGNING_SECRET + WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n// Pass-through when unset.\n\nconst secret = $env.CALENDLY_SIGNING_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.rawBody || (typeof item.body === 'string' ? item.body : JSON.stringify(item.body || {}));\nconst headers = item.headers || {};\nconst sigHeader = headers['calendly-webhook-signature'] || headers['Calendly-Webhook-Signature'];\n\nif (!sigHeader || typeof sigHeader !== 'string') {\n  throw new Error('UNAUTHORIZED: missing Calendly-Webhook-Signature header');\n}\n\n// Parse `t=<ts>,v1=<hmac>` into a map\nconst parts = {};\nfor (const segment of sigHeader.split(',')) {\n  const [k, v] = segment.split('=');\n  if (k && v) parts[k.trim()] = v.trim();\n}\nconst ts = parts.t;\nconst v1 = parts.v1;\n\nif (!ts || !v1) {\n  throw new Error('UNAUTHORIZED: malformed Calendly signature header');\n}\n\n// Replay-window check: 5 minutes\nconst tsNum = parseInt(ts, 10);\nif (!Number.isFinite(tsNum)) {\n  throw new Error('UNAUTHORIZED: invalid timestamp');\n}\nconst nowSec = Math.floor(Date.now() / 1000);\nconst REPLAY_WINDOW_S = 5 * 60;\nif (Math.abs(nowSec - tsNum) > REPLAY_WINDOW_S) {\n  throw new Error('UNAUTHORIZED: signature timestamp outside replay window');\n}\n\nconst signedPayload = ts + '.' + rawBody;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');\n\n// Length-guard before constant-time compare\nif (v1.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expBuf = Buffer.from(expected, 'utf8');\nconst v1Buf = Buffer.from(v1, 'utf8');\nif (!crypto.timingSafeEqual(expBuf, v1Buf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
+        "jsCode": "// Calendly v2 HMAC signature verification, opt-in.\n// Header: Calendly-Webhook-Signature with format `t=<unix-ts>,v1=<hmac-sha256>`\n// HMAC payload: `<timestamp>.<rawBody>` (Stripe-like, not just rawBody).\n//\n// Enable by setting CALENDLY_SIGNING_SECRET + WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n// Pass-through when unset.\n\nconst secret = $env.CALENDLY_SIGNING_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.json.rawBody || (typeof item.json.body === 'string' ? item.json.body : JSON.stringify(item.json.body || {}));\nconst headers = item.json.headers || {};\nconst sigHeader = headers['calendly-webhook-signature'] || headers['Calendly-Webhook-Signature'];\n\nif (!sigHeader || typeof sigHeader !== 'string') {\n  throw new Error('UNAUTHORIZED: missing Calendly-Webhook-Signature header');\n}\n\n// Parse `t=<ts>,v1=<hmac>` into a map\nconst parts = {};\nfor (const segment of sigHeader.split(',')) {\n  const [k, v] = segment.split('=');\n  if (k && v) parts[k.trim()] = v.trim();\n}\nconst ts = parts.t;\nconst v1 = parts.v1;\n\nif (!ts || !v1) {\n  throw new Error('UNAUTHORIZED: malformed Calendly signature header');\n}\n\n// Replay-window check: 5 minutes\nconst tsNum = parseInt(ts, 10);\nif (!Number.isFinite(tsNum)) {\n  throw new Error('UNAUTHORIZED: invalid timestamp');\n}\nconst nowSec = Math.floor(Date.now() / 1000);\nconst REPLAY_WINDOW_S = 5 * 60;\nif (Math.abs(nowSec - tsNum) > REPLAY_WINDOW_S) {\n  throw new Error('UNAUTHORIZED: signature timestamp outside replay window');\n}\n\nconst signedPayload = ts + '.' + rawBody;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');\n\n// Length-guard before constant-time compare\nif (v1.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expBuf = Buffer.from(expected, 'utf8');\nconst v1Buf = Buffer.from(v1, 'utf8');\nif (!crypto.timingSafeEqual(expBuf, v1Buf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
       },
       "id": "cal-pp-1-verify",
       "name": "Verify Webhook (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [440, 60]
+      "position": [
+        440,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Per-IP sliding-window rate limit, opt-in.\n// Enable by setting RATE_LIMIT_ENABLED=1.\n// 60 requests per 5 minutes per IP.\n//\n// $getWorkflowStaticData is per-instance, not cluster-aware. Replace with\n// Redis INCR + EXPIRE for multi-worker n8n. Snippet at the bottom.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst headers = item.headers || {};\nconst rawIp = headers['x-forwarded-for'] || headers['x-real-ip'] || 'unknown';\nconst key = String(rawIp).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];\n\n// Redis variant for clustered n8n:\n// const Redis = require('ioredis');\n// const redis = new Redis(process.env.REDIS_URL);\n// const cnt = await redis.incr('rl:' + key);\n// if (cnt === 1) await redis.expire('rl:' + key, 300);\n// await redis.quit();\n// if (cnt > LIMIT) throw new Error('RATE_LIMIT_EXCEEDED');"
+        "jsCode": "// Per-IP sliding-window rate limit, opt-in.\n// Enable by setting RATE_LIMIT_ENABLED=1.\n// 60 requests per 5 minutes per IP.\n//\n// $getWorkflowStaticData is per-instance, not cluster-aware. Replace with\n// Redis INCR + EXPIRE for multi-worker n8n. Snippet at the bottom.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst rawIp = headers['x-forwarded-for'] || headers['x-real-ip'] || 'unknown';\nconst key = String(rawIp).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];\n\n// Redis variant for clustered n8n:\n// const Redis = require('ioredis');\n// const redis = new Redis(process.env.REDIS_URL);\n// const cnt = await redis.incr('rl:' + key);\n// if (cnt === 1) await redis.expire('rl:' + key, 300);\n// await redis.quit();\n// if (cnt > LIMIT) throw new Error('RATE_LIMIT_EXCEEDED');"
       },
       "id": "cal-pp-2-ratelimit",
       "name": "Rate Limit (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [640, 60]
+      "position": [
+        640,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// 5-minute idempotency window on Calendly event.uri, opt-in.\n// Enable by setting IDEMPOTENCY_ENABLED=1.\n// Calendly retries on 5xx for up to 24 hours, but a 5-minute window catches\n// the storm of retries that follow a recovery. The longer-tail retries\n// usually arrive after the first successful processing.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 10000;\n\nconst item = $input.first();\nconst body = item.body || {};\n// Calendly v2 payload: { event: 'invitee.created', payload: { event: { uri }, invitee: { uri } } }\nconst eventUri = body.payload && body.payload.event && body.payload.event.uri;\nconst inviteeUri = body.payload && body.payload.invitee && body.payload.invitee.uri;\nconst evtName = body.event || 'unknown';\nconst idempotencyKey = (eventUri && inviteeUri) ? (evtName + ':' + eventUri + ':' + inviteeUri) : null;\n\nif (!idempotencyKey) {\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 1000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[idempotencyKey]) {\n  return [{ json: { skipped: true, reason: 'duplicate', idempotencyKey } }];\n}\nseen[idempotencyKey] = now;\n\nreturn [$input.first()];\n\n// Redis variant:\n// const result = await redis.set('idem:' + idempotencyKey, '1', 'EX', 300, 'NX');\n// if (result === null) return [];"
+        "jsCode": "// 5-minute idempotency window on Calendly event.uri, opt-in.\n// Enable by setting IDEMPOTENCY_ENABLED=1.\n// Calendly retries on 5xx for up to 24 hours, but a 5-minute window catches\n// the storm of retries that follow a recovery. The longer-tail retries\n// usually arrive after the first successful processing.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 10000;\n\nconst item = $input.first();\nconst body = item.json.body || {};\n// Calendly v2 payload: { event: 'invitee.created', payload: { event: { uri }, invitee: { uri } } }\nconst eventUri = body.payload && body.payload.event && body.payload.event.uri;\nconst inviteeUri = body.payload && body.payload.invitee && body.payload.invitee.uri;\nconst evtName = body.event || 'unknown';\nconst idempotencyKey = (eventUri && inviteeUri) ? (evtName + ':' + eventUri + ':' + inviteeUri) : null;\n\nif (!idempotencyKey) {\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 1000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[idempotencyKey]) {\n  // Duplicate detected. Emit a sentinel item that the\n  // 'Skip If Duplicate' IF node routes to 'Respond Duplicate'\n  // (200 OK + { deduped: true }). Without that 200 the source\n  // provider would hold the HTTP connection until n8n's webhook\n  // timeout (default 30s) and mark delivery failed.\n  return [{ json: { skipped: true, reason: 'duplicate', dedupKey: String(idempotencyKey) } }];\n}\nseen[idempotencyKey] = now;\n\nreturn [$input.first()];\n\n// Redis variant:\n// const result = await redis.set('idem:' + idempotencyKey, '1', 'EX', 300, 'NX');\n// if (result === null) return [];"
       },
       "id": "cal-pp-3-idempotency",
       "name": "Idempotency Check (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [840, 60]
+      "position": [
+        840,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Normalize Calendly v2 nested webhook payload into a stable schema.\n// Calendly v2 ships everything inside body.payload with `invitee` and `event` sub-objects.\n\nconst body = $input.first().body || {};\nconst eventName = body.event || 'unknown';\nconst payload = body.payload || {};\nconst event = payload.event || {};\nconst invitee = payload.invitee || {};\nconst scheduled = payload.scheduled_event || event;\n\nconst questionAnswers = Array.isArray(invitee.questions_and_answers) ? invitee.questions_and_answers : [];\nconst answersMap = {};\nfor (const qa of questionAnswers) {\n  if (qa && qa.question && qa.answer != null) answersMap[String(qa.question).toLowerCase().trim()] = String(qa.answer).trim();\n}\n\nreturn [{\n  json: {\n    eventName,\n    eventUri: event.uri || scheduled.uri || null,\n    inviteeUri: invitee.uri || null,\n    inviteeEmail: (invitee.email || '').toLowerCase(),\n    inviteeName: invitee.name || invitee.first_name || 'Unknown',\n    inviteeTimezone: invitee.timezone || null,\n    eventTypeName: scheduled.name || event.name || 'Calendly booking',\n    eventStartTime: scheduled.start_time || event.start_time || null,\n    eventEndTime: scheduled.end_time || event.end_time || null,\n    cancelReason: invitee.cancellation && invitee.cancellation.reason ? invitee.cancellation.reason : null,\n    canceler: invitee.cancellation && invitee.cancellation.canceled_by ? invitee.cancellation.canceled_by : null,\n    questionAnswers: answersMap,\n    receivedAt: new Date().toISOString(),\n  },\n}];"
+        "jsCode": "// Normalize Calendly v2 nested webhook payload into a stable schema.\n// Calendly v2 ships everything inside body.payload with `invitee` and `event` sub-objects.\n\nconst body = $input.first().json.body || {};\nconst eventName = body.event || 'unknown';\nconst payload = body.payload || {};\nconst event = payload.event || {};\nconst invitee = payload.invitee || {};\nconst scheduled = payload.scheduled_event || event;\n\nconst questionAnswers = Array.isArray(invitee.questions_and_answers) ? invitee.questions_and_answers : [];\nconst answersMap = {};\nfor (const qa of questionAnswers) {\n  if (qa && qa.question && qa.answer != null) answersMap[String(qa.question).toLowerCase().trim()] = String(qa.answer).trim();\n}\n\nreturn [{\n  json: {\n    eventName,\n    eventUri: event.uri || scheduled.uri || null,\n    inviteeUri: invitee.uri || null,\n    inviteeEmail: (invitee.email || '').toLowerCase(),\n    inviteeName: invitee.name || invitee.first_name || 'Unknown',\n    inviteeTimezone: invitee.timezone || null,\n    eventTypeName: scheduled.name || event.name || 'Calendly booking',\n    eventStartTime: scheduled.start_time || event.start_time || null,\n    eventEndTime: scheduled.end_time || event.end_time || null,\n    cancelReason: invitee.cancellation && invitee.cancellation.reason ? invitee.cancellation.reason : null,\n    canceler: invitee.cancellation && invitee.cancellation.canceled_by ? invitee.cancellation.canceled_by : null,\n    questionAnswers: answersMap,\n    receivedAt: new Date().toISOString(),\n  },\n}];"
       },
       "id": "cal-1-normalize",
       "name": "Normalize Payload",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1040, 60]
+      "position": [
+        1040,
+        60
+      ]
     },
     {
       "parameters": {
@@ -104,7 +128,10 @@
       "name": "Classify Event",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1240, 60]
+      "position": [
+        1240,
+        60
+      ]
     },
     {
       "parameters": {
@@ -114,7 +141,10 @@
       "name": "Set CRM Target",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1440, 60]
+      "position": [
+        1440,
+        60
+      ]
     },
     {
       "parameters": {
@@ -193,7 +223,10 @@
       "name": "Route by CRM",
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.2,
-      "position": [1640, 60]
+      "position": [
+        1640,
+        60
+      ]
     },
     {
       "parameters": {
@@ -235,7 +268,10 @@
       "name": "Pipedrive Upsert Deal",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1840, -100],
+      "position": [
+        1840,
+        -100
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -264,7 +300,10 @@
       "name": "HubSpot Upsert Deal",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1840, 60],
+      "position": [
+        1840,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -293,7 +332,10 @@
       "name": "Salesforce Upsert Deal",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1840, 220],
+      "position": [
+        1840,
+        220
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -304,7 +346,10 @@
       "name": "Normalize CRM Output",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2040, 60]
+      "position": [
+        2040,
+        60
+      ]
     },
     {
       "parameters": {
@@ -319,7 +364,10 @@
       "name": "Slack Ops Notification",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2240, 60],
+      "position": [
+        2240,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -334,7 +382,10 @@
       "name": "Respond to Calendly",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [2440, 60]
+      "position": [
+        2440,
+        60
+      ]
     },
     {
       "parameters": {
@@ -344,7 +395,10 @@
       "name": "Error Fallback",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2240, 380]
+      "position": [
+        2240,
+        380
+      ]
     },
     {
       "parameters": {
@@ -359,7 +413,10 @@
       "name": "Error Slack Alert",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2440, 380],
+      "position": [
+        2440,
+        380
+      ],
       "onError": "continueRegularOutput"
     },
     {
@@ -374,7 +431,69 @@
       "name": "Error Respond to Calendly",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [2640, 380]
+      "position": [
+        2640,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-06-calendly-to-crm-sync-skipped",
+              "leftValue": "={{ $json.skipped }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "06-cal-if-skip-dup",
+      "name": "Skip If Duplicate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, deduped: true, reason: \"duplicate\" }) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "X-Dedup",
+                "value": "1"
+              }
+            ]
+          }
+        }
+      },
+      "id": "06-cal-respond-duplicate",
+      "name": "Respond Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        -120
+      ]
     }
   ],
   "connections": {
@@ -415,7 +534,7 @@
       "main": [
         [
           {
-            "node": "Normalize Payload",
+            "node": "Skip If Duplicate",
             "type": "main",
             "index": 0
           }
@@ -579,6 +698,24 @@
         [
           {
             "node": "Error Respond to Calendly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip If Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Respond Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize Payload",
             "type": "main",
             "index": 0
           }

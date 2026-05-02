@@ -132,6 +132,126 @@ jobs:
           fi
           echo "OK: no credential leaks detected"
 
+      - name: Code-node semantic lint
+        run: |
+          # Static semantic linter for Code-node jsCode bodies.
+          # Catches the bug class where authors unwrap n8n's $input.first()
+          # without going through .json. n8n's INodeExecutionData has shape
+          # { json: {...}, binary?: {...} }, so the webhook payload lives at
+          # $input.first().json.body, .json.headers, .json.rawBody, etc.
+          # The unwrapped form returns undefined and silently gets `|| {}`'d.
+          #
+          # Lint rules:
+          #   FAIL on:
+          #     /\$input\.first\(\)\.(body|headers|rawBody|params|query)\b/
+          #     /\$input\.first\(\)\[['"](body|headers|rawBody|params|query)['"]\]/
+          #     /\$input\.last\(\)\.(body|headers|rawBody|params|query)\b/
+          #     /\$input\.all\(\)\[\d+\]\.(body|headers|rawBody|params|query)\b/
+          set -e
+          fail=0
+          for wf in templates/*/workflow.json; do
+            case "$wf" in
+              templates/_TEMPLATE/*) continue ;;
+            esac
+            hits=$(node -e "
+              const fs = require('fs');
+              const w = JSON.parse(fs.readFileSync('$wf', 'utf8'));
+              const patterns = [
+                /\\\$input\\.first\\(\\)\\.(body|headers|rawBody|params|query)\\b/g,
+                /\\\$input\\.first\\(\\)\\[['\"](body|headers|rawBody|params|query)['\"]\\]/g,
+                /\\\$input\\.last\\(\\)\\.(body|headers|rawBody|params|query)\\b/g,
+                /\\\$input\\.all\\(\\)\\[\\d+\\]\\.(body|headers|rawBody|params|query)\\b/g,
+              ];
+              const found = [];
+              for (const n of w.nodes || []) {
+                const code = (n.parameters && n.parameters.jsCode) || '';
+                if (typeof code !== 'string') continue;
+                for (const re of patterns) {
+                  let m;
+                  while ((m = re.exec(code)) !== null) {
+                    found.push(n.name + ': ' + m[0]);
+                  }
+                }
+              }
+              if (found.length) {
+                console.log(found.join('\\n'));
+                process.exit(1);
+              }
+            " 2>&1) || hits_failed=1
+            if [ -n "${hits_failed:-}" ]; then
+              echo "::error file=$wf::FAIL: \$input access leak (must go through .json)"
+              echo "$hits"
+              fail=1
+              unset hits_failed
+            fi
+          done
+          if [ $fail -eq 1 ]; then
+            echo ""
+            echo "n8n's \$input.first() / .last() / .all()[N] return INodeExecutionData"
+            echo "with shape { json: {...}, binary?: {...} }. The webhook payload lives"
+            echo "at .json.body, .json.headers, .json.rawBody, .json.params, .json.query."
+            echo "Run scripts/fix-input-access.py to auto-fix the .first() form."
+            exit 1
+          fi
+          echo "OK: no \$input access leaks across template Code-nodes"
+
+      - name: Idempotency-skipped flow guard
+        run: |
+          # Catches the regression where an Idempotency Check Code-node emits
+          # a `{ skipped: true }` sentinel that leaks downstream into Normalize
+          # / Slack / CRM and produces duplicate side-effects.
+          #
+          # Two valid patterns:
+          #   Pattern A (T01/T02/T06/T07/T10): emit sentinel + IF-gateway
+          #     route to a `Respond Duplicate` node. Workflow has both
+          #     'Skip If Duplicate' (IF) AND 'Respond Duplicate' nodes.
+          #   Pattern B (T11/T13): mark+filter inside an internal stage,
+          #     external sinks never see the sentinel.
+          #
+          # FAIL when neither pattern is present in a workflow that has an
+          # Idempotency Check Code-node returning a sentinel.
+          set -e
+          fail=0
+          for wf in templates/*/workflow.json; do
+            case "$wf" in
+              templates/_TEMPLATE/*) continue ;;
+              templates/11-email-to-notion/*) continue ;;
+              templates/13-webhook-audit-trail/*) continue ;;
+            esac
+            check=$(node -e "
+              const fs = require('fs');
+              const w = JSON.parse(fs.readFileSync('$wf', 'utf8'));
+              const sentinelRe = /if\\s*\\(seen\\[[^\\]]+\\]\\)\\s*\\{[^}]*return\\s*\\[\\{\\s*json:\\s*\\{\\s*skipped:\\s*true/;
+              const names = new Set((w.nodes || []).map(n => n.name));
+              const hasGateway = names.has('Skip If Duplicate') && names.has('Respond Duplicate');
+              for (const n of w.nodes || []) {
+                if (n.name !== 'Idempotency Check (opt-in)') continue;
+                const code = (n.parameters && n.parameters.jsCode) || '';
+                if (typeof code !== 'string') continue;
+                if (sentinelRe.test(code) && !hasGateway) {
+                  console.log(n.name + ': returns sentinel { skipped: true } without IF + Respond Duplicate gateway');
+                  process.exit(1);
+                }
+              }
+            " 2>&1) || sentinel_failed=1
+            if [ -n "${sentinel_failed:-}" ]; then
+              echo "::error file=$wf::FAIL: idempotency-check sentinel leak (no IF + Respond Duplicate)"
+              echo "$check"
+              fail=1
+              unset sentinel_failed
+            fi
+          done
+          if [ $fail -eq 1 ]; then
+            echo ""
+            echo "When the Idempotency Check returns a { skipped: true } sentinel,"
+            echo "the workflow MUST have a 'Skip If Duplicate' IF node and a"
+            echo "'Respond Duplicate' respondToWebhook node so the sentinel is"
+            echo "routed to a 200 OK instead of leaking into Normalize/Send."
+            echo "Run scripts/fix-idempotency-respond.py to auto-add the gateway."
+            exit 1
+          fi
+          echo "OK: no idempotency sentinel leaks (gateway + respond present where needed)"
+
       - name: Em-dash guard
         run: |
           # Em-dashes (U+2014) are AI-content signature and forbidden in markdown + workflow.json.

@@ -12,7 +12,10 @@
       "name": "Sticky Note - Intro",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, -100]
+      "position": [
+        -200,
+        -100
+      ]
     },
     {
       "parameters": {
@@ -25,7 +28,10 @@
       "name": "Sticky Note - Setup",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-200, 240]
+      "position": [
+        -200,
+        240
+      ]
     },
     {
       "parameters": {
@@ -38,7 +44,10 @@
       "name": "Sticky Note - Production Patterns",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [840, -260]
+      "position": [
+        840,
+        -260
+      ]
     },
     {
       "parameters": {
@@ -53,58 +62,76 @@
       "name": "GitHub Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [240, 60],
+      "position": [
+        240,
+        60
+      ],
       "webhookId": "github-issues"
     },
     {
       "parameters": {
-        "jsCode": "// GitHub HMAC-SHA256 signature verification, opt-in.\n// Header: X-Hub-Signature-256 with format `sha256=<hex>`.\n// Enable by setting GITHUB_WEBHOOK_SECRET + WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n\nconst secret = $env.GITHUB_WEBHOOK_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.rawBody || (typeof item.body === 'string' ? item.body : JSON.stringify(item.body || {}));\nconst headers = item.headers || {};\nconst sigHeader = headers['x-hub-signature-256'] || headers['X-Hub-Signature-256'];\n\nif (!sigHeader || typeof sigHeader !== 'string') {\n  throw new Error('UNAUTHORIZED: missing X-Hub-Signature-256 header');\n}\n\n// Strip the `sha256=` prefix\nif (!sigHeader.startsWith('sha256=')) {\n  throw new Error('UNAUTHORIZED: malformed signature header (expected sha256= prefix)');\n}\nconst providedSig = sigHeader.slice('sha256='.length);\n\nconst expected = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex');\n\nif (providedSig.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expBuf = Buffer.from(expected, 'utf8');\nconst provBuf = Buffer.from(providedSig, 'utf8');\nif (!crypto.timingSafeEqual(expBuf, provBuf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
+        "jsCode": "// GitHub HMAC-SHA256 signature verification, opt-in.\n// Header: X-Hub-Signature-256 with format `sha256=<hex>`.\n// Enable by setting GITHUB_WEBHOOK_SECRET + WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n\nconst secret = $env.GITHUB_WEBHOOK_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.json.rawBody || (typeof item.json.body === 'string' ? item.json.body : JSON.stringify(item.json.body || {}));\nconst headers = item.json.headers || {};\nconst sigHeader = headers['x-hub-signature-256'] || headers['X-Hub-Signature-256'];\n\nif (!sigHeader || typeof sigHeader !== 'string') {\n  throw new Error('UNAUTHORIZED: missing X-Hub-Signature-256 header');\n}\n\n// Strip the `sha256=` prefix\nif (!sigHeader.startsWith('sha256=')) {\n  throw new Error('UNAUTHORIZED: malformed signature header (expected sha256= prefix)');\n}\nconst providedSig = sigHeader.slice('sha256='.length);\n\nconst expected = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex');\n\nif (providedSig.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expBuf = Buffer.from(expected, 'utf8');\nconst provBuf = Buffer.from(providedSig, 'utf8');\nif (!crypto.timingSafeEqual(expBuf, provBuf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
       },
       "id": "gh-pp-1-verify",
       "name": "Verify Webhook (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [440, 60]
+      "position": [
+        440,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Per-IP sliding-window rate limit, opt-in. Same pattern as the other templates.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst headers = item.headers || {};\nconst rawIp = headers['x-forwarded-for'] || headers['x-real-ip'] || 'unknown';\nconst key = String(rawIp).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];"
+        "jsCode": "// Per-IP sliding-window rate limit, opt-in. Same pattern as the other templates.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst rawIp = headers['x-forwarded-for'] || headers['x-real-ip'] || 'unknown';\nconst key = String(rawIp).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a, b) => (a[1][0] || 0) - (b[1][0] || 0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];"
       },
       "id": "gh-pp-2-ratelimit",
       "name": "Rate Limit (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [640, 60]
+      "position": [
+        640,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// 5-minute idempotency window on X-GitHub-Delivery, opt-in.\n// GitHub's per-delivery UUID is the canonical idempotency key.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 10000;\n\nconst item = $input.first();\nconst headers = item.headers || {};\nconst deliveryId = headers['x-github-delivery'] || headers['X-GitHub-Delivery'];\n\nif (!deliveryId) {\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 1000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[deliveryId]) {\n  return [{ json: { skipped: true, reason: 'duplicate', deliveryId } }];\n}\nseen[deliveryId] = now;\n\nreturn [$input.first()];"
+        "jsCode": "// 5-minute idempotency window on X-GitHub-Delivery, opt-in.\n// GitHub's per-delivery UUID is the canonical idempotency key.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 10000;\n\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst deliveryId = headers['x-github-delivery'] || headers['X-GitHub-Delivery'];\n\nif (!deliveryId) {\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a, b) => a[1] - b[1]).slice(0, 1000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[deliveryId]) {\n  // Duplicate detected. Emit a sentinel item that the\n  // 'Skip If Duplicate' IF node routes to 'Respond Duplicate'\n  // (200 OK + { deduped: true }). Without that 200 the source\n  // provider would hold the HTTP connection until n8n's webhook\n  // timeout (default 30s) and mark delivery failed.\n  return [{ json: { skipped: true, reason: 'duplicate', dedupKey: String(deliveryId) } }];\n}\nseen[deliveryId] = now;\n\nreturn [$input.first()];"
       },
       "id": "gh-pp-3-idempotency",
       "name": "Idempotency Check (opt-in)",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [840, 60]
+      "position": [
+        840,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Filter event types. Only forward issues.opened / reopened / labeled.\n// GitHub sends one webhook per `Issues` event. The action field tells us which.\n// Returns [] (empty array) for non-forwarded actions so the branch halts cleanly.\n\nconst body = $input.first().body || {};\nconst action = body.action || 'unknown';\nconst FORWARD_ACTIONS = ['opened', 'reopened', 'labeled'];\n\nif (!FORWARD_ACTIONS.includes(action)) {\n  // Halt branch. Returning [] (not a sentinel object) prevents downstream nodes\n  // from running with empty data and creating blank tracker tickets.\n  return [];\n}\n\nreturn [$input.first()];"
+        "jsCode": "// Filter event types. Only forward issues.opened / reopened / labeled.\n// GitHub sends one webhook per `Issues` event. The action field tells us which.\n// Returns [] (empty array) for non-forwarded actions so the branch halts cleanly.\n\nconst body = $input.first().json.body || {};\nconst action = body.action || 'unknown';\nconst FORWARD_ACTIONS = ['opened', 'reopened', 'labeled'];\n\nif (!FORWARD_ACTIONS.includes(action)) {\n  // Halt branch. Returning [] (not a sentinel object) prevents downstream nodes\n  // from running with empty data and creating blank tracker tickets.\n  return [];\n}\n\nreturn [$input.first()];"
       },
       "id": "gh-2-filter",
       "name": "Filter Event Type",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1040, 60]
+      "position": [
+        1040,
+        60
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Normalize GitHub issue payload into a stable schema.\n\nconst body = $input.first().body || {};\nconst issue = body.issue || {};\nconst repo = body.repository || {};\nconst sender = body.sender || {};\nconst headers = $input.first().headers || {};\n\nconst labels = Array.isArray(issue.labels) ? issue.labels.map(l => String(l && l.name || '').toLowerCase()).filter(Boolean) : [];\n\nreturn [{\n  json: {\n    deliveryId: headers['x-github-delivery'] || headers['X-GitHub-Delivery'] || ('unknown-' + Date.now()),\n    action: body.action,\n    issueNumber: issue.number,\n    issueId: issue.id,\n    issueTitle: issue.title || 'Untitled',\n    issueBody: issue.body || '',\n    issueUrl: issue.html_url,\n    issueState: issue.state,\n    repoFullName: repo.full_name,\n    repoUrl: repo.html_url,\n    reporterLogin: sender.login,\n    labels,\n    receivedAt: new Date().toISOString(),\n  },\n}];"
+        "jsCode": "// Normalize GitHub issue payload into a stable schema.\n\nconst body = $input.first().json.body || {};\nconst issue = body.issue || {};\nconst repo = body.repository || {};\nconst sender = body.sender || {};\nconst headers = $input.first().json.headers || {};\n\nconst labels = Array.isArray(issue.labels) ? issue.labels.map(l => String(l && l.name || '').toLowerCase()).filter(Boolean) : [];\n\nreturn [{\n  json: {\n    deliveryId: headers['x-github-delivery'] || headers['X-GitHub-Delivery'] || ('unknown-' + Date.now()),\n    action: body.action,\n    issueNumber: issue.number,\n    issueId: issue.id,\n    issueTitle: issue.title || 'Untitled',\n    issueBody: issue.body || '',\n    issueUrl: issue.html_url,\n    issueState: issue.state,\n    repoFullName: repo.full_name,\n    repoUrl: repo.html_url,\n    reporterLogin: sender.login,\n    labels,\n    receivedAt: new Date().toISOString(),\n  },\n}];"
       },
       "id": "gh-3-normalize",
       "name": "Normalize Payload",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1240, 60]
+      "position": [
+        1240,
+        60
+      ]
     },
     {
       "parameters": {
@@ -114,7 +141,10 @@
       "name": "Classify by Labels",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1440, 60]
+      "position": [
+        1440,
+        60
+      ]
     },
     {
       "parameters": {
@@ -124,7 +154,10 @@
       "name": "Set Tracker Target",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1640, 60]
+      "position": [
+        1640,
+        60
+      ]
     },
     {
       "parameters": {
@@ -132,13 +165,20 @@
           "values": [
             {
               "conditions": {
-                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
                 "combinator": "and",
                 "conditions": [
                   {
                     "leftValue": "={{ $json.trackerTarget }}",
                     "rightValue": "linear",
-                    "operator": { "type": "string", "operation": "equals" }
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
                   }
                 ]
               },
@@ -146,13 +186,20 @@
             },
             {
               "conditions": {
-                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
                 "combinator": "and",
                 "conditions": [
                   {
                     "leftValue": "={{ $json.trackerTarget }}",
                     "rightValue": "jira",
-                    "operator": { "type": "string", "operation": "equals" }
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
                   }
                 ]
               },
@@ -160,13 +207,20 @@
             },
             {
               "conditions": {
-                "options": { "caseSensitive": false, "typeValidation": "loose", "version": 2 },
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
                 "combinator": "and",
                 "conditions": [
                   {
                     "leftValue": "={{ $json.trackerTarget }}",
                     "rightValue": "clickup",
-                    "operator": { "type": "string", "operation": "equals" }
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
                   }
                 ]
               },
@@ -180,7 +234,10 @@
       "name": "Route by Tracker",
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.2,
-      "position": [1840, 60]
+      "position": [
+        1840,
+        60
+      ]
     },
     {
       "parameters": {
@@ -208,7 +265,10 @@
       "name": "Linear Create Issue",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2040, -100],
+      "position": [
+        2040,
+        -100
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -235,7 +295,10 @@
       "name": "Jira Create Issue",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2040, 60],
+      "position": [
+        2040,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -264,7 +327,10 @@
       "name": "ClickUp Create Task",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2040, 220],
+      "position": [
+        2040,
+        220
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -275,7 +341,10 @@
       "name": "Normalize Tracker Output",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2240, 60]
+      "position": [
+        2240,
+        60
+      ]
     },
     {
       "parameters": {
@@ -303,7 +372,10 @@
       "name": "Comment on GitHub Issue",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2440, 60],
+      "position": [
+        2440,
+        60
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -318,7 +390,10 @@
       "name": "Respond to GitHub",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [2640, 60]
+      "position": [
+        2640,
+        60
+      ]
     },
     {
       "parameters": {
@@ -328,7 +403,10 @@
       "name": "Error Fallback",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2440, 380]
+      "position": [
+        2440,
+        380
+      ]
     },
     {
       "parameters": {
@@ -343,7 +421,10 @@
       "name": "Error Slack Alert",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2640, 380],
+      "position": [
+        2640,
+        380
+      ],
       "onError": "continueRegularOutput"
     },
     {
@@ -358,52 +439,308 @@
       "name": "Error Respond to GitHub",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [2840, 380]
+      "position": [
+        2840,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-07-github-issues-to-tracker-skipped",
+              "leftValue": "={{ $json.skipped }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "07-git-if-skip-dup",
+      "name": "Skip If Duplicate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, deduped: true, reason: \"duplicate\" }) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "X-Dedup",
+                "value": "1"
+              }
+            ]
+          }
+        }
+      },
+      "id": "07-git-respond-duplicate",
+      "name": "Respond Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        -120
+      ]
     }
   ],
   "connections": {
-    "GitHub Webhook": { "main": [[{ "node": "Verify Webhook (opt-in)", "type": "main", "index": 0 }]] },
-    "Verify Webhook (opt-in)": { "main": [[{ "node": "Rate Limit (opt-in)", "type": "main", "index": 0 }]] },
-    "Rate Limit (opt-in)": { "main": [[{ "node": "Idempotency Check (opt-in)", "type": "main", "index": 0 }]] },
-    "Idempotency Check (opt-in)": { "main": [[{ "node": "Filter Event Type", "type": "main", "index": 0 }]] },
-    "Filter Event Type": { "main": [[{ "node": "Normalize Payload", "type": "main", "index": 0 }]] },
-    "Normalize Payload": { "main": [[{ "node": "Classify by Labels", "type": "main", "index": 0 }]] },
-    "Classify by Labels": { "main": [[{ "node": "Set Tracker Target", "type": "main", "index": 0 }]] },
-    "Set Tracker Target": { "main": [[{ "node": "Route by Tracker", "type": "main", "index": 0 }]] },
+    "GitHub Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Webhook (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Webhook (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Rate Limit (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate Limit (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Skip If Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Event Type": {
+      "main": [
+        [
+          {
+            "node": "Normalize Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Payload": {
+      "main": [
+        [
+          {
+            "node": "Classify by Labels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify by Labels": {
+      "main": [
+        [
+          {
+            "node": "Set Tracker Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Tracker Target": {
+      "main": [
+        [
+          {
+            "node": "Route by Tracker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Route by Tracker": {
       "main": [
-        [{ "node": "Linear Create Issue", "type": "main", "index": 0 }],
-        [{ "node": "Jira Create Issue", "type": "main", "index": 0 }],
-        [{ "node": "ClickUp Create Task", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Linear Create Issue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Jira Create Issue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ClickUp Create Task",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Linear Create Issue": {
       "main": [
-        [{ "node": "Normalize Tracker Output", "type": "main", "index": 0 }],
-        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Normalize Tracker Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Jira Create Issue": {
       "main": [
-        [{ "node": "Normalize Tracker Output", "type": "main", "index": 0 }],
-        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Normalize Tracker Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "ClickUp Create Task": {
       "main": [
-        [{ "node": "Normalize Tracker Output", "type": "main", "index": 0 }],
-        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Normalize Tracker Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Normalize Tracker Output": { "main": [[{ "node": "Comment on GitHub Issue", "type": "main", "index": 0 }]] },
+    "Normalize Tracker Output": {
+      "main": [
+        [
+          {
+            "node": "Comment on GitHub Issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Comment on GitHub Issue": {
       "main": [
-        [{ "node": "Respond to GitHub", "type": "main", "index": 0 }],
-        [{ "node": "Error Fallback", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Respond to GitHub",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Error Fallback": { "main": [[{ "node": "Error Slack Alert", "type": "main", "index": 0 }]] },
-    "Error Slack Alert": { "main": [[{ "node": "Error Respond to GitHub", "type": "main", "index": 0 }]] }
+    "Error Fallback": {
+      "main": [
+        [
+          {
+            "node": "Error Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Error Respond to GitHub",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip If Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Respond Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Filter Event Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   },
   "settings": {
     "executionOrder": "v1"

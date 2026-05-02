@@ -2,6 +2,36 @@
 
 All notable changes to this repository will be documented here. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-05-02
+
+External ChatGPT audit on the public repo flagged three bug classes ranging from CRITICAL to MEDIUM. All three fixed in this release plus two CI semantic-lint guards added so the bug classes cannot regress.
+
+### Fixed
+
+- **CRITICAL: `$input.first().X` used in Code-nodes instead of `$input.first().json.X`.** n8n's `$input.first()` returns `INodeExecutionData` with shape `{ json, binary, paired }`; the webhook payload lives at `.json.body`, `.json.headers`, `.json.rawBody`, `.json.params`, `.json.query`. Authors of T01, T02, T06, T07, T10, and the `_TEMPLATE` skeleton wrote the unwrapped form (`$input.first().body`), which returns `undefined` and was masked by `|| {}`. Net effect: Verify Signature, Rate Limit, Idempotency Check, and Normalize all silently processed an empty event object. The pre-activation check did not catch it because it only validates node types, not expression semantics. Auto-fix script `scripts/fix-input-access.py` rewrote 57 sites across 7 files. The script now also handles bracket notation (`$input.first()['body']`), `$input.last().X`, `$input.all()[N].X`, and ES6 destructure (`const { body } = $input.first()` rewritten to `const { body } = $input.first().json`).
+- **HIGH: T01 / T02 / T06 / T07 / T10 idempotency-skipped sentinel leaked into Send / CRM nodes.** The Idempotency Check Code-node returned `[{ json: { skipped: true, reason: 'duplicate' } }]` on a duplicate. The sentinel item flowed downstream into Normalize / Slack / CRM and produced duplicate side-effects (Slack message, lead insert). The first remediation (`return []`) halted the branch but caused a worse failure mode: all five templates use `responseMode: responseNode` on the Webhook trigger, so an empty-array return holds the HTTP connection open until the webhook timeout (30s default), Stripe / Calendly / GitHub mark delivery "failed" and retry every few hours for up to three days. Final fix: each Idempotency Check now emits a sentinel item that an inserted `IF` node ("Skip If Duplicate") routes either to a new `respondToWebhook` node ("Respond Duplicate", `200 OK + { ok: true, deduped: true, reason: 'duplicate' }`) or to the existing live-path. Auto-fix script: `scripts/fix-idempotency-respond.py`.
+- **MEDIUM: T13 hash-chain race condition.** The pre-fix SQL relied on `SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1 FOR UPDATE` to lock the latest row. Two concurrent inserts could both read id=99 as latest: Tx1 locks id=99, Tx2 blocks; Tx1 inserts id=100 with `prev_hash = row_99.row_hash` and commits; Tx2 unblocks but its CTE snapshot does not see id=100, so Tx2 also inserts with `prev_hash = row_99.row_hash`. Chain fork. Fix: wrap the read in a transaction-scoped advisory lock that serializes all chain inserts, with `MATERIALIZED` CTEs used as optimization fences so the lock is acquired before audit_log is scanned. The `FOR UPDATE` row-lock is kept as a belt-and-suspenders defense against direct SQL writers that bypass this workflow. Auto-fix script: `scripts/fix-t13-hash-chain.py`. SQL skeleton: `WITH advisory AS MATERIALIZED (SELECT pg_advisory_xact_lock(hashtext('audit_log_chain:default')) AS lock_acquired), last AS MATERIALIZED (SELECT row_hash AS prev_hash FROM audit_log CROSS JOIN advisory ORDER BY id DESC LIMIT 1 FOR UPDATE), seed AS (...) INSERT INTO audit_log (...) SELECT ... RETURNING id, prev_hash, row_hash;`. Per-tenant chains documented as a future extension by parameterizing the lock key.
+
+### Added
+
+- **CI step: Code-node semantic lint** in `.github/workflows/validate-workflows.yml`. Catches the `$input.first().X` bug class plus three sibling patterns (`$input.first()['body']` bracket notation, `$input.last().X`, `$input.all()[N].X`). Runs on every PR and push.
+- **CI step: Idempotency-skipped flow guard** in the same file. A workflow that emits a `{ skipped: true }` sentinel from an Idempotency Check Code-node MUST also include a `Skip If Duplicate` IF node and a `Respond Duplicate` respondToWebhook node, otherwise CI fails. T11 + T13 are exempt because they use a mark-and-filter pattern that keeps the sentinel inside an internal stage.
+- **Test payloads for two more templates.** `examples/audit-event-signed.json` (T13 generic CRM event) and `examples/github-issue-opened.json` (T07 GitHub Issues webhook). `examples/README.md` extended with signed-curl recipes for T07 (GitHub `X-Hub-Signature-256: sha256=<hex>`) and T13 (Stripe-style `<timestamp>.<rawBody>` signing with `x-audit-timestamp` + `x-audit-signature` headers, plus a chain-integrity verification SQL snippet).
+- **Three auto-fix scripts under `scripts/`:** `fix-input-access.py`, `fix-idempotency-respond.py`, `fix-t13-hash-chain.py`. All idempotent (re-runs are no-ops when already fixed).
+
+### Changed
+
+- **`templates/13-webhook-audit-trail/README.md` Hash-Chain section** rewritten to describe the advisory-lock + MATERIALIZED-CTE serialization and document the per-tenant-chain extension path.
+- **`templates/13-webhook-audit-trail/workflow.json` two sticky notes** updated to reflect the new lock pattern. `Build Audit Row` Code-node header comment updated.
+- **`examples/README.md`** idempotency replay-test description rewritten to explain the new behaviour: duplicate gets a 200 OK with `{ ok: true, deduped: true }` from the dedicated `Respond Duplicate` node rather than relying on the source provider's retry budget.
+
+### Quality gate
+
+- 3-agent cold-review pass after the initial fix found a HIGH bug in the first remediation (Stripe `responseMode: responseNode` + `return []` causes 30s timeout). All Critic findings fixed before this changelog was written.
+- Re-validated locally: 3 CI steps green on all 15 templates (structural validation, code-node semantic lint, idempotency-skipped guard).
+- Em-dash audit clean across templates, examples, root markdown, scripts, and CI workflow files.
+- All three fix scripts are idempotent (verified via re-run).
+
 ## [0.3.0] - 2026-05-02
 
 Five more production templates. Repo grows from 10 to 15 hardened workflows, all sharing the same opt-in production-pattern foundation. The 10-item Tier-4 backlog is now complete.

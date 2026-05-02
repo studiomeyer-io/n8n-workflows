@@ -1,6 +1,6 @@
 # Template Status
 
-> **Single source of truth for what is hardened, what is in-progress, where the distribution push stands.** Updated per release. Last update: 2026-05-02 (v0.3.0 release with templates 11-15).
+> **Single source of truth for what is hardened, what is in-progress, where the distribution push stands.** Updated per release. Last update: 2026-05-02 (v0.3.1 fix-pass after external ChatGPT audit).
 
 ## Per-template status
 
@@ -27,7 +27,7 @@
 | Item | Status |
 |---|---|
 | MIT License + CONTRIBUTING + SECURITY + COC + ECOSYSTEM | Done |
-| GitHub Actions CI (workflow.json validation, em-dash guard, forbidden-keys check, credential-leak scan) | Done |
+| GitHub Actions CI (workflow.json validation, em-dash guard, forbidden-keys check, credential-leak scan, code-node semantic lint, idempotency-skipped guard) | Done |
 | `templates/_TEMPLATE/` skeleton on v0.1.0 standard | Done |
 | Cover images (Flux 2 Max, 1216x640, navy + gold) for all 5 templates | Done |
 | Comparison tables vs other public n8n template repos | Done |
