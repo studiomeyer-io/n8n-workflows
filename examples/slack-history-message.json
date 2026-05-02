@@ -1,0 +1,44 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "type": "message",
+      "user": "U01ABCDEFGH",
+      "text": "Quick reminder team, the Q2 OKRs are due Friday. Let me know if anyone needs help with formatting.",
+      "ts": "1714694400.000200",
+      "team": "T01ABCDEFGH"
+    },
+    {
+      "type": "message",
+      "user": "U02ZYXWVUTSR",
+      "text": "I just shipped the new pricing page. PR is up: github.com/example/repo/pull/123",
+      "ts": "1714695000.000300",
+      "team": "T01ABCDEFGH"
+    },
+    {
+      "type": "message",
+      "user": "U01ABCDEFGH",
+      "text": "Nice work. Will review tonight.",
+      "ts": "1714695100.000400",
+      "team": "T01ABCDEFGH"
+    },
+    {
+      "type": "message",
+      "user": "U03ABCDEFGH",
+      "text": "Customer Maria S. from Acme Mittelstand asked about the n8n integration. They want to know if our workflow templates work with the new memory layer. Logged ticket SUP-1234.",
+      "ts": "1714698700.000500",
+      "team": "T01ABCDEFGH"
+    },
+    {
+      "type": "message",
+      "user": "U02ZYXWVUTSR",
+      "text": "Yes, we have templates 1 through 8 hardened on n8n-templates repo, plus 5 more on n8n-workflows for non-memory use cases. Will reply to Maria with the link.",
+      "ts": "1714698800.000600",
+      "team": "T01ABCDEFGH"
+    }
+  ],
+  "has_more": false,
+  "response_metadata": {
+    "next_cursor": ""
+  }
+}

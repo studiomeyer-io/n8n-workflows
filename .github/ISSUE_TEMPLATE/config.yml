@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Memory-backed templates
+    url: https://github.com/studiomeyer-io/n8n-templates
+    about: For workflow templates that wire StudioMeyer Memory (cross-session context, knowledge graph), use the sister repo.
+  - name: StudioMeyer Memory product
+    url: https://memory.studiomeyer.io
+    about: Issues with the hosted Memory backend (auth, API errors, latency).
+  - name: Custom node bugs
+    url: https://github.com/studiomeyer-io/n8n-nodes-studiomeyer-memory/issues
+    about: Bugs in the n8n-nodes-studiomeyer-memory community node itself.
+  - name: Template ideas + workflow suggestions
+    url: https://github.com/studiomeyer-io/n8n-workflows/discussions
+    about: Discussion before opening a template-request issue.

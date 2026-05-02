@@ -1,0 +1,37 @@
+{
+  "id": "evt_3OqRq2Heuy7eN1Y90Yt8sOoF",
+  "object": "event",
+  "api_version": "2024-12-18.acacia",
+  "created": 1714694400,
+  "type": "checkout.session.completed",
+  "data": {
+    "object": {
+      "id": "cs_test_a1B2c3D4e5F6g7H8i9J0kLmNoPqRsTuVwXyZ",
+      "object": "checkout.session",
+      "amount_total": 2900,
+      "currency": "usd",
+      "customer": "cus_QwErTyUiOpAsDfGh",
+      "customer_email": "maria.schmidt@acme-mittelstand.de",
+      "customer_details": {
+        "email": "maria.schmidt@acme-mittelstand.de",
+        "name": "Maria Schmidt",
+        "address": {
+          "country": "DE"
+        }
+      },
+      "metadata": {
+        "plan": "pro",
+        "source": "studiomeyer.io"
+      },
+      "mode": "subscription",
+      "payment_status": "paid",
+      "subscription": "sub_1OqRq2Heuy7eN1Y9PP0cKbPx",
+      "status": "complete"
+    }
+  },
+  "livemode": false,
+  "request": {
+    "id": "req_abcdef",
+    "idempotency_key": null
+  }
+}

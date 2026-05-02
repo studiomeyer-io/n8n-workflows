@@ -1,0 +1,15 @@
+{
+  "submission_id": "sub_2026_05_02_001",
+  "email": "maria.schmidt@acme-mittelstand.de",
+  "name": "Maria Schmidt",
+  "company": "Acme Mittelstand GmbH",
+  "phone": "+49 170 555 4444",
+  "budget": "10k-50k",
+  "authority": "Head of Operations",
+  "need": "We process 200 customer support tickets per day and need to automate triage and first-response. Looking for an AI agent that can read past tickets and answer with company-specific context.",
+  "timeline": "this quarter",
+  "intent": "Saw your dev.to article on n8n + memory. Want to schedule a demo for next week.",
+  "source": "dev.to",
+  "utm_source": "dev.to",
+  "utm_campaign": "n8n-templates"
+}

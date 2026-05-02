@@ -1,0 +1,92 @@
+# Smoke-test the Code-node snippets shipped in templates against the sample
+# payloads in examples/. Catches the failure mode where workflow.json is JSON-valid
+# but the JS inside Code nodes throws on a real provider payload.
+#
+# Status: STUB. The harness extracts Code-node `jsCode` snippets, wires the
+# matching example payload as `$input.first()`, and asserts no exception. Plus
+# JSON-schema validation of every example/*.json. Tracker:
+#   https://github.com/studiomeyer-io/n8n-workflows/issues/new?title=CI%20smoke-test%20full%20harness
+#
+# v0.1.0 ships the production-pattern Code nodes inline. v0.2.0 ships the full
+# smoke runner with an n8n-Workflow-Function shim around the snippets. Until
+# then this job validates payload JSON schema only and reports skipped tests
+# in the summary so the gap is visible.
+
+name: smoke-test-snippets
+on:
+  pull_request:
+    paths:
+      - 'templates/**/workflow.json'
+      - 'examples/**.json'
+      - '.github/workflows/smoke-test-snippets.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'templates/**/workflow.json'
+      - 'examples/**.json'
+
+jobs:
+  payload-schema:
+    name: examples/ JSON validity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate every example payload is valid JSON
+        run: |
+          set -eu
+          fail=0
+          for f in examples/*.json; do
+            if ! python3 -c "import json; json.load(open('$f'))"; then
+              echo "::error file=$f::Invalid JSON"
+              fail=1
+            else
+              echo "ok: $f"
+            fi
+          done
+          exit $fail
+
+  workflow-payload-pairing:
+    name: workflow.json <-> examples/ pairing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Each template that needs an example payload has one
+        run: |
+          set -eu
+          fail=0
+          # T01 (Form to CRM Lead Router) needs form-submit.json
+          if [ ! -f examples/form-submit.json ]; then
+            echo "::error::T01 Form to CRM Lead Router needs examples/form-submit.json"
+            fail=1
+          fi
+          # T02 (Stripe Lifecycle to Slack) needs at least one Stripe event example
+          if [ ! -f examples/stripe-checkout-completed.json ] && [ ! -f examples/stripe-subscription-created.json ]; then
+            echo "::error::T02 Stripe Lifecycle to Slack needs examples/stripe-checkout-completed.json or stripe-subscription-created.json"
+            fail=1
+          fi
+          # T05 (Slack Channel Daily Digest) needs slack-history-message.json
+          if [ ! -f examples/slack-history-message.json ]; then
+            echo "::error::T05 Slack Channel Daily Digest needs examples/slack-history-message.json"
+            fail=1
+          fi
+          # T03 (Uptime) and T04 (SSL) are schedule-driven, no example payloads required.
+          exit $fail
+
+  snippet-execution:
+    name: execute Code-node snippets against example payloads
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: STUB - full harness pending
+        run: |
+          echo "::warning::Full Code-node snippet smoke-test is stubbed."
+          echo "Tracker: https://github.com/studiomeyer-io/n8n-workflows/issues"
+          echo "Manual smoke pattern documented in examples/README.md."
+          # Future implementation:
+          #   1. Extract every node[].parameters.jsCode from workflow.json
+          #   2. Wrap in (function ($input, $env, $getWorkflowStaticData) { ... })
+          #   3. Feed examples/*.json as $input.first().json
+          #   4. Assert no exception, sane output shape
+          # For now we only assert workflow.json is valid JSON (already covered
+          # by validate-workflows.yml) and example payloads are valid JSON
+          # (covered by the payload-schema job above).

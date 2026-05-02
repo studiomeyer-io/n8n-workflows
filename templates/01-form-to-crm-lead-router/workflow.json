@@ -1,0 +1,604 @@
+{
+  "name": "Form to CRM Lead Router (Pipedrive / HubSpot / Salesforce)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Form to CRM Lead Router\n\nForm webhook lands here, BANT scoring decides hot / warm / cold, multi-CRM Switch routes to Pipedrive (default), HubSpot, or Salesforce.\n\n**Production patterns wired:**\n- HMAC verify (opt-in, `LEAD_FORM_SIGNING_SECRET`)\n- Rate limit (opt-in, `RATE_LIMIT_ENABLED=1`)\n- Idempotency on submission ID (opt-in, `IDEMPOTENCY_ENABLED=1`)\n- Error branches with structured fallback\n\nSee `README.md` for setup, env vars, and extension recipes.",
+        "height": 300,
+        "width": 400,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Configure your form provider (Webflow / Tally / Typeform / custom HTML form) to POST to this webhook URL.\n2. Optional: enable HMAC by setting `LEAD_FORM_SIGNING_SECRET` env var and configuring the same secret in your form provider.\n3. Set `CRM_TARGET=pipedrive` (or `hubspot` or `salesforce`) in your n8n env.\n4. Set CRM stage IDs: `CRM_PIPELINE_HOT_ID`, `CRM_PIPELINE_WARM_ID`, `CRM_PIPELINE_COLD_ID`.\n5. Configure Slack webhook URL in `SLACK_OPS_WEBHOOK` for ops notifications.",
+        "height": 280,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 220]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-form",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "form-1-trigger",
+      "name": "Form Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 60],
+      "webhookId": "lead-form"
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 signature verification, opt-in.\n// Enable by setting LEAD_FORM_SIGNING_SECRET in your n8n env\n// AND configuring the same secret in your form provider.\n// Pass-through when unset.\n\nconst secret = $env.LEAD_FORM_SIGNING_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  // Disabled by design, let the request through.\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.rawBody || (typeof item.body === 'string' ? item.body : JSON.stringify(item.body || {}));\nconst providedSig = item.headers && (item.headers['x-form-signature'] || item.headers['X-Form-Signature']);\n\nif (!providedSig) {\n  throw new Error('UNAUTHORIZED: missing x-form-signature header');\n}\n\nconst expected = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex');\n\n// Length-guard before constant-time compare. Without this, a 1-char\n// signature throws RangeError = free DoS on the verifier.\nif (providedSig.length !== expected.length) {\n  throw new Error('UNAUTHORIZED: signature length mismatch');\n}\n\nconst expectedBuf = Buffer.from(expected, 'utf8');\nconst providedBuf = Buffer.from(providedSig, 'utf8');\n\nif (!crypto.timingSafeEqual(expectedBuf, providedBuf)) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
+      },
+      "id": "form-pp-1-verify",
+      "name": "Verify Webhook (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-IP sliding-window rate limit, opt-in.\n// Enable by setting RATE_LIMIT_ENABLED=1 in your n8n env.\n// 60 requests per 5 minutes per IP. Adjust below.\n//\n// For real production loads put rate limiting on a reverse proxy\n// (Nginx limit_req_zone, Cloudflare WAF, Traefik). This node is\n// defense-in-depth, not the primary control.\n//\n// $getWorkflowStaticData is per-instance and not cluster-aware.\n// Multi-worker n8n: replace with Redis INCR + EXPIRE (snippet below).\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst item = $input.first();\nconst ip = (item.headers && (item.headers['x-forwarded-for'] || item.headers['x-real-ip'])) || 'unknown';\nconst key = String(ip).split(',')[0].trim();\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\n// Evict expired entries\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\n// Cap map size\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a,b) => (a[1][0]||0) - (b[1][0]||0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' requests per ' + Math.round(WINDOW_MS / 60000) + ' minutes for ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];\n\n// Redis variant for clustered n8n:\n// const Redis = require('ioredis');\n// const redis = new Redis(process.env.REDIS_URL);\n// const cnt = await redis.incr('rl:' + key);\n// if (cnt === 1) await redis.expire('rl:' + key, 300);\n// await redis.quit();\n// if (cnt > LIMIT) throw new Error('RATE_LIMIT_EXCEEDED');"
+      },
+      "id": "form-pp-2-ratelimit",
+      "name": "Rate Limit (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 5-minute idempotency window on form submission ID, opt-in.\n// Enable by setting IDEMPOTENCY_ENABLED=1.\n// Form providers retry on 5xx. Without dedup we create the lead twice in CRM.\n//\n// Replace the in-memory block with Redis SET NX EX 300 for clustered n8n.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 10000;\n\nconst item = $input.first();\nconst body = item.body || {};\n// Idempotency key: provider-supplied submission ID, fallback to email + minute-bucketed timestamp\nconst submissionId = body.submission_id || body.id;\nconst email = (body.email || '').toLowerCase();\nconst minuteBucket = Math.floor(Date.now() / 60000);\nconst idempotencyKey = submissionId || (email && (email + ':' + minuteBucket));\n\nif (!idempotencyKey) {\n  // No deduplicable key, let it through\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\n// Evict expired\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\n// Cap size\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a,b) => a[1] - b[1]).slice(0, 1000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[idempotencyKey]) {\n  return [{ json: { skipped: true, reason: 'duplicate', idempotencyKey } }];\n}\nseen[idempotencyKey] = now;\n\nreturn [$input.first()];\n\n// Redis variant:\n// const result = await redis.set('idem:' + idempotencyKey, '1', 'EX', 300, 'NX');\n// if (result === null) return [];"
+      },
+      "id": "form-pp-3-idempotency",
+      "name": "Idempotency Check (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize the form payload into a stable schema regardless of provider\n// (Webflow / Tally / Typeform / custom HTML). Map common field names.\n\nconst body = ($input.first().body || {});\n\nconst pick = (...keys) => {\n  for (const k of keys) {\n    if (body[k] != null && String(body[k]).trim() !== '') return String(body[k]).trim();\n  }\n  return null;\n};\n\nconst submissionId = pick('submission_id', 'id', 'submissionId') || ('lead-' + Date.now());\nconst email = (pick('email', 'email_address', 'EmailAddress') || '').toLowerCase();\nconst name = pick('name', 'full_name', 'fullName', 'first_name') || 'Unknown';\nconst company = pick('company', 'organization', 'company_name', 'org') || null;\nconst phone = pick('phone', 'phoneNumber', 'phone_number') || null;\n\n// BANT-aligned input fields. Form-provider-specific names mapped here.\nconst budget = pick('budget', 'budget_range', 'monthly_budget') || null;\nconst authority = pick('authority', 'role', 'job_title', 'title') || null;\nconst need = pick('need', 'pain_point', 'problem', 'use_case') || null;\nconst timeline = pick('timeline', 'when', 'urgency', 'start_date') || null;\nconst intent = pick('intent', 'reason', 'message', 'notes') || null;\nconst source = pick('source', 'utm_source', 'referrer') || 'direct';\n\nreturn [{\n  json: {\n    submissionId,\n    email,\n    name,\n    company,\n    phone,\n    bant: { budget, authority, need, timeline, intent },\n    source,\n    receivedAt: new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "form-1-normalize",
+      "name": "Normalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// BANT scoring: 0-100 score from Budget / Authority / Need / Timeline + Intent.\n// Each filled-out BANT field is worth 20 points. Intent is worth 20.\n// Override the rubric below for your sales motion.\n\nconst input = $input.first().json;\nconst { bant } = input;\n\nlet score = 0;\nconst reasons = [];\n\n// Budget signal\nif (bant.budget) {\n  const b = String(bant.budget).toLowerCase();\n  if (b.includes('10k') || b.includes('25k') || b.includes('50k') || b.includes('100k') || b.includes('enterprise')) {\n    score += 25;\n    reasons.push('high-budget');\n  } else if (b.includes('5k') || b.includes('1k') || b.includes('mid')) {\n    score += 15;\n    reasons.push('mid-budget');\n  } else {\n    score += 8;\n    reasons.push('budget-disclosed');\n  }\n}\n\n// Authority signal\nif (bant.authority) {\n  const a = String(bant.authority).toLowerCase();\n  if (a.includes('ceo') || a.includes('founder') || a.includes('vp') || a.includes('director') || a.includes('head')) {\n    score += 25;\n    reasons.push('decision-maker');\n  } else if (a.includes('manager') || a.includes('lead')) {\n    score += 15;\n    reasons.push('influencer');\n  } else {\n    score += 8;\n    reasons.push('individual-contributor');\n  }\n}\n\n// Need signal (free-text length proxy)\nif (bant.need) {\n  const len = String(bant.need).length;\n  if (len > 100) { score += 20; reasons.push('detailed-need'); }\n  else if (len > 30) { score += 12; reasons.push('clear-need'); }\n  else { score += 6; reasons.push('vague-need'); }\n}\n\n// Timeline signal\nif (bant.timeline) {\n  const t = String(bant.timeline).toLowerCase();\n  if (t.includes('immediate') || t.includes('now') || t.includes('this month') || t.includes('week')) {\n    score += 20;\n    reasons.push('urgent-timeline');\n  } else if (t.includes('quarter') || t.includes('month')) {\n    score += 12;\n    reasons.push('mid-timeline');\n  } else {\n    score += 6;\n    reasons.push('long-timeline');\n  }\n}\n\n// Intent signal\nif (bant.intent && String(bant.intent).length > 30) {\n  score += 10;\n  reasons.push('expressed-intent');\n}\n\nlet temperature = 'cold';\nif (score >= 70) temperature = 'hot';\nelse if (score >= 40) temperature = 'warm';\n\nreturn [{\n  json: {\n    ...input,\n    score,\n    temperature,\n    scoringReasons: reasons,\n  },\n}];"
+      },
+      "id": "form-2-score",
+      "name": "BANT Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pick CRM target from env. Default pipedrive.\n// Pick stage ID from temperature.\n\nconst input = $input.first().json;\nconst crmTarget = ($env.CRM_TARGET || 'pipedrive').toLowerCase();\n\nconst stageMap = {\n  hot: $env.CRM_PIPELINE_HOT_ID || '1',\n  warm: $env.CRM_PIPELINE_WARM_ID || '2',\n  cold: $env.CRM_PIPELINE_COLD_ID || '3',\n};\n\nconst stageId = stageMap[input.temperature] || stageMap.cold;\n\nreturn [{\n  json: {\n    ...input,\n    crmTarget,\n    stageId,\n  },\n}];"
+      },
+      "id": "form-3-set-routing",
+      "name": "Set CRM Target",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 60]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.crmTarget }}",
+                    "rightValue": "pipedrive",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "pipedrive"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.crmTarget }}",
+                    "rightValue": "hubspot",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "hubspot"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.crmTarget }}",
+                    "rightValue": "salesforce",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "salesforce"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "form-4-route",
+      "name": "Route by CRM",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1640, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.pipedrive.com/v1/deals",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "api_token",
+              "value": "={{ $credentials.pipedriveApi.apiToken }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "title",
+              "value": "={{ $json.name }} ({{ $json.company || $json.email }}) - {{ $json.temperature }}"
+            },
+            {
+              "name": "value",
+              "value": "0"
+            },
+            {
+              "name": "currency",
+              "value": "EUR"
+            },
+            {
+              "name": "stage_id",
+              "value": "={{ $json.stageId }}"
+            },
+            {
+              "name": "person_id",
+              "value": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "form-5a-pipedrive",
+      "name": "Pipedrive Create Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, -100],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/deals",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.hubspotApi.accessToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: { dealname: $json.name + ' (' + ($json.company || $json.email) + ') - ' + $json.temperature, amount: '0', dealstage: $json.stageId } }) }}",
+        "options": {}
+      },
+      "id": "form-5b-hubspot",
+      "name": "HubSpot Create Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-instance.my.salesforce.com/services/data/v60.0/sobjects/Opportunity",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.salesforceApi.accessToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ Name: $json.name + ' (' + ($json.company || $json.email) + ') - ' + $json.temperature, StageName: $json.stageId, Amount: 0, CloseDate: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10) }) }}",
+        "options": {}
+      },
+      "id": "form-5c-salesforce",
+      "name": "Salesforce Create Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 220],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize CRM response shape so downstream nodes do not care which CRM\n// fired. Pull deal_id and deal_url where possible.\n\nconst input = $input.first();\nconst body = input.json || {};\nconst incoming = body;\n\n// Pipedrive returns { success: true, data: { id, ... } }\n// HubSpot returns { id, properties, ... }\n// Salesforce returns { id, success, errors, ... }\nlet dealId = null;\nlet dealUrl = null;\n\nif (incoming.data && incoming.data.id) {\n  dealId = incoming.data.id;\n} else if (incoming.id) {\n  dealId = incoming.id;\n}\n\nreturn [{\n  json: {\n    ...incoming,\n    dealId,\n    dealUrl,\n    crmSuccess: !!dealId,\n  },\n}];"
+      },
+      "id": "form-6-normalize-crm",
+      "name": "Normalize CRM Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2040, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'New ' + ($json.temperature || 'unknown').toUpperCase() + ' lead from ' + ($json.email || 'unknown') + ' via ' + ($json.source || 'unknown') + ' (score ' + ($json.score || 0) + ')' }) }}",
+        "options": {}
+      },
+      "id": "form-7-slack",
+      "name": "Slack Ops Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2240, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, dealId: $json.dealId, temperature: $json.temperature, score: $json.score }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "form-8-respond",
+      "name": "Respond to Form",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback for downstream API failures (Pipedrive / HubSpot / Salesforce / Slack).\n// Builds a structured error log and produces a graceful response so the form\n// submitter sees a 200 instead of a hung request.\n\nconst input = $input.first();\nconst err = (input.json && input.json.error) || input.error || {};\nconst original = ($('Set CRM Target').first() && $('Set CRM Target').first().json) || {};\n\nreturn [{\n  json: {\n    ok: false,\n    fallback: true,\n    submissionId: original.submissionId || 'unknown',\n    crmTarget: original.crmTarget || 'unknown',\n    stage: original.temperature || 'unknown',\n    error: {\n      message: err.message || 'unknown error',\n      name: err.name || 'CrmError',\n    },\n    receivedAt: original.receivedAt || new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "form-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: Lead-router error ' + ($json.error.name || 'CrmError') + ': ' + ($json.error.message || '') + ' (submission ' + ($json.submissionId || 'unknown') + ', target ' + ($json.crmTarget || 'unknown') + ')' }) }}",
+        "options": {}
+      },
+      "id": "form-err-slack-alert",
+      "name": "Error Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 380],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, message: 'Lead recorded, downstream sync deferred' }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "form-err-respond",
+      "name": "Error Respond to Form",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2640, 380]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\nFour patterns wired as opt-in nodes. Default-off via env vars so import boots clean.\n\n- **HMAC verify:** `LEAD_FORM_SIGNING_SECRET` + `WEBHOOK_INTEGRITY_CHECK_ENABLED=1`\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 req / 5 min / IP)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (5-min window on submission ID)\n- **Error branch:** always on. Every HTTP node has `onError: continueErrorOutput` wired to the Error Fallback Code node.\n\nFor clustered n8n, swap the in-memory dedup for Redis SET NX EX 300. Snippet in each opt-in node's comments.",
+        "height": 320,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    }
+  ],
+  "connections": {
+    "Form Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Webhook (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Webhook (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Rate Limit (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate Limit (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Payload": {
+      "main": [
+        [
+          {
+            "node": "BANT Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BANT Score": {
+      "main": [
+        [
+          {
+            "node": "Set CRM Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set CRM Target": {
+      "main": [
+        [
+          {
+            "node": "Route by CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by CRM": {
+      "main": [
+        [
+          {
+            "node": "Pipedrive Create Deal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HubSpot Create Deal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Salesforce Create Deal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Pipedrive Create Deal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipedrive Create Deal": {
+      "main": [
+        [
+          {
+            "node": "Normalize CRM Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Create Deal": {
+      "main": [
+        [
+          {
+            "node": "Normalize CRM Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Salesforce Create Deal": {
+      "main": [
+        [
+          {
+            "node": "Normalize CRM Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize CRM Output": {
+      "main": [
+        [
+          {
+            "node": "Slack Ops Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Ops Notification": {
+      "main": [
+        [
+          {
+            "node": "Respond to Form",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Fallback": {
+      "main": [
+        [
+          {
+            "node": "Error Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Error Respond to Form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

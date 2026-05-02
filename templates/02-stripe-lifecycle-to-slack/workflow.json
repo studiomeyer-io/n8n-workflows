@@ -1,0 +1,265 @@
+{
+  "name": "Stripe Lifecycle to Slack (Signed Webhooks, Per-Event Messages)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Stripe Lifecycle to Slack\n\nStripe webhook lands here, the signature is verified against your `STRIPE_WEBHOOK_SECRET`, the event is routed by type into a per-event Slack message in Block Kit format.\n\n**Event types handled:**\n- `checkout.session.completed` (new paid customer)\n- `customer.subscription.created`\n- `customer.subscription.updated` (plan change)\n- `customer.subscription.deleted` (cancellation)\n- `invoice.payment_failed`\n\nUnknown event types are logged and a generic notification is sent.",
+        "height": 300,
+        "width": 400,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. In Stripe Dashboard, Developers, Webhooks: add a new endpoint pointing to this n8n webhook URL.\n2. Subscribe to events: `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.payment_failed`.\n3. Copy the signing secret (starts with `whsec_`) and set as n8n env: `STRIPE_WEBHOOK_SECRET`.\n4. Set `WEBHOOK_INTEGRITY_CHECK_ENABLED=1` to enforce signature verification.\n5. Configure Slack incoming webhook URL in `SLACK_BILLING_WEBHOOK`.",
+        "height": 280,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 220]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stripe-webhook",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "stripe-1-trigger",
+      "name": "Stripe Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 60],
+      "webhookId": "stripe-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Stripe-specific HMAC signature verification.\n// Stripe signs webhooks as `t=<timestamp>,v1=<hmac-sha256>`.\n// We verify the signature AND a 5-minute replay-window.\n//\n// Enable by setting STRIPE_WEBHOOK_SECRET (whsec_...) AND\n// WEBHOOK_INTEGRITY_CHECK_ENABLED=1.\n\nconst secret = $env.STRIPE_WEBHOOK_SECRET;\nconst integrityCheckEnabled = $env.WEBHOOK_INTEGRITY_CHECK_ENABLED === '1';\n\nif (!secret || !integrityCheckEnabled) {\n  return [$input.first()];\n}\n\nconst crypto = require('crypto');\nconst item = $input.first();\nconst rawBody = item.rawBody || '';\nconst sigHeader = (item.headers && (item.headers['stripe-signature'] || item.headers['Stripe-Signature'])) || '';\n\nif (!sigHeader || !rawBody) {\n  throw new Error('UNAUTHORIZED: missing Stripe-Signature or rawBody');\n}\n\n// Parse `t=<ts>,v1=<sig>[,v0=<...>]` shape\nconst pairs = String(sigHeader).split(',').map(p => p.trim());\nlet timestamp = null;\nconst v1Sigs = [];\nfor (const p of pairs) {\n  const [k, ...rest] = p.split('=');\n  const v = rest.join('=');\n  if (k === 't') timestamp = v;\n  else if (k === 'v1') v1Sigs.push(v);\n}\n\nif (!timestamp || v1Sigs.length === 0) {\n  throw new Error('UNAUTHORIZED: malformed Stripe-Signature header');\n}\n\n// Replay-window: reject events older than 5 minutes\nconst REPLAY_WINDOW_S = 300;\nconst tsNum = parseInt(timestamp, 10);\nif (!Number.isFinite(tsNum) || Math.abs(Math.floor(Date.now() / 1000) - tsNum) > REPLAY_WINDOW_S) {\n  throw new Error('UNAUTHORIZED: timestamp outside replay window');\n}\n\n// Compute expected v1 = HMAC-SHA256(secret, timestamp + '.' + rawBody)\nconst signedPayload = timestamp + '.' + rawBody;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');\nconst expectedBuf = Buffer.from(expected, 'utf8');\n\n// Constant-time compare against any of the v1 signatures (Stripe rotates)\nlet match = false;\nfor (const sig of v1Sigs) {\n  if (sig.length !== expected.length) continue;  // length-guard\n  const sigBuf = Buffer.from(sig, 'utf8');\n  if (crypto.timingSafeEqual(expectedBuf, sigBuf)) {\n    match = true;\n    break;\n  }\n}\n\nif (!match) {\n  throw new Error('UNAUTHORIZED: invalid signature');\n}\n\nreturn [$input.first()];"
+      },
+      "id": "stripe-pp-1-verify",
+      "name": "Verify Stripe Signature (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-customer-id sliding-window rate limit, opt-in.\n// 60 events per 5 minutes per customer. Defends against a leaked\n// signing-secret being used to spam events.\n\nif ($env.RATE_LIMIT_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst LIMIT = 60;\nconst WINDOW_MS = 5 * 60 * 1000;\nconst MAX_KEYS = 5000;\n\nconst event = ($input.first().body || {});\nconst customer = (event.data && event.data.object && event.data.object.customer) || 'unknown';\nconst key = String(customer);\n\nconst data = $getWorkflowStaticData('global');\ndata.rateBuckets = data.rateBuckets || {};\nconst buckets = data.rateBuckets;\nconst now = Date.now();\n\nfor (const k of Object.keys(buckets)) {\n  buckets[k] = (buckets[k] || []).filter(t => now - t < WINDOW_MS);\n  if (buckets[k].length === 0) delete buckets[k];\n}\nif (Object.keys(buckets).length > MAX_KEYS) {\n  const oldest = Object.entries(buckets).sort((a,b) => (a[1][0]||0) - (b[1][0]||0)).slice(0, 100);\n  for (const [k] of oldest) delete buckets[k];\n}\n\nconst hits = buckets[key] || [];\nif (hits.length >= LIMIT) {\n  throw new Error('RATE_LIMIT_EXCEEDED: ' + LIMIT + ' events per ' + Math.round(WINDOW_MS / 60000) + ' minutes for customer ' + key);\n}\nbuckets[key] = [...hits, now];\n\nreturn [$input.first()];"
+      },
+      "id": "stripe-pp-2-ratelimit",
+      "name": "Rate Limit (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Idempotency on Stripe event.id. Stripe retries failed webhook deliveries\n// up to 3 days. Without dedup we send duplicate Slack messages per retry.\n\nif ($env.IDEMPOTENCY_ENABLED !== '1') {\n  return [$input.first()];\n}\n\nconst WINDOW_MS = 24 * 60 * 60 * 1000;  // 24h, Stripe retries within 3d\nconst MAX_KEYS = 50000;\n\nconst event = ($input.first().body || {});\nconst eventId = event.id;\n\nif (!eventId) {\n  return [$input.first()];\n}\n\nconst data = $getWorkflowStaticData('global');\ndata.seenKeys = data.seenKeys || {};\nconst seen = data.seenKeys;\nconst now = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > WINDOW_MS) delete seen[k];\n}\nif (Object.keys(seen).length > MAX_KEYS) {\n  const oldest = Object.entries(seen).sort((a,b) => a[1] - b[1]).slice(0, 5000);\n  for (const [k] of oldest) delete seen[k];\n}\n\nif (seen[eventId]) {\n  return [{ json: { skipped: true, reason: 'duplicate', eventId } }];\n}\nseen[eventId] = now;\n\nreturn [$input.first()];"
+      },
+      "id": "stripe-pp-3-idempotency",
+      "name": "Idempotency Check (opt-in)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize the Stripe event into a stable shape for the Slack-message builder.\n// Pull customer, amount, plan, status across the supported event types.\n\nconst event = ($input.first().body || {});\nconst type = event.type || 'unknown';\nconst obj = (event.data && event.data.object) || {};\n\nconst customer = obj.customer || obj.customer_email || 'unknown';\nconst customerEmail = (obj.customer_details && obj.customer_details.email) || obj.customer_email || obj.receipt_email || null;\nconst customerName = (obj.customer_details && obj.customer_details.name) || null;\nconst country = (obj.customer_details && obj.customer_details.address && obj.customer_details.address.country) || null;\n\n// Amount in major currency (e.g. EUR, USD)\nconst amountMinor = obj.amount_total ?? obj.amount_due ?? obj.amount_paid ?? null;\nconst currency = (obj.currency || 'usd').toUpperCase();\nconst amount = amountMinor != null ? (amountMinor / 100).toFixed(2) : null;\n\nconst plan = (obj.metadata && obj.metadata.plan)\n  || (obj.items && obj.items.data && obj.items.data[0] && obj.items.data[0].price && obj.items.data[0].price.nickname)\n  || null;\n\nconst status = obj.status || obj.payment_status || null;\nconst subscriptionId = obj.subscription || (obj.id && obj.id.startsWith('sub_') ? obj.id : null);\n\nreturn [{\n  json: {\n    eventId: event.id,\n    eventType: type,\n    customer,\n    customerEmail,\n    customerName,\n    country,\n    amount,\n    currency,\n    plan,\n    status,\n    subscriptionId,\n    livemode: !!event.livemode,\n    receivedAt: new Date().toISOString(),\n    raw: event,\n  },\n}];"
+      },
+      "id": "stripe-1-normalize",
+      "name": "Normalize Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a Slack Block Kit message tuned per event type.\n// Falls through to a generic message for unknown types.\n\nconst e = $input.first().json;\nconst envEmoji = e.livemode ? ':white_check_mark:' : ':warning: TEST';\nconst customerLine = e.customerName\n  ? `${e.customerName} (${e.customerEmail || e.customer})`\n  : (e.customerEmail || e.customer);\n\nconst amountLine = e.amount ? `*${e.amount} ${e.currency}*` : null;\nconst planLine = e.plan ? `Plan: *${e.plan}*` : null;\n\nlet header = '';\nlet color = '#36a64f';\n\nswitch (e.eventType) {\n  case 'checkout.session.completed':\n    header = `${envEmoji} New paid customer: ${customerLine}`;\n    color = '#36a64f';\n    break;\n  case 'customer.subscription.created':\n    header = `${envEmoji} Subscription started: ${customerLine}`;\n    color = '#2eb886';\n    break;\n  case 'customer.subscription.updated':\n    header = `:arrows_counterclockwise: Subscription updated: ${customerLine}`;\n    color = '#daa038';\n    break;\n  case 'customer.subscription.deleted':\n    header = `:warning: Subscription cancelled: ${customerLine}`;\n    color = '#d93f0b';\n    break;\n  case 'invoice.payment_failed':\n    header = `:rotating_light: Payment failed: ${customerLine}`;\n    color = '#a30200';\n    break;\n  default:\n    header = `:bell: Stripe event ${e.eventType}: ${customerLine}`;\n    color = '#666666';\n    break;\n}\n\nconst fields = [];\nif (amountLine) fields.push({ type: 'mrkdwn', text: amountLine });\nif (planLine) fields.push({ type: 'mrkdwn', text: planLine });\nif (e.country) fields.push({ type: 'mrkdwn', text: `Country: *${e.country}*` });\nif (e.status) fields.push({ type: 'mrkdwn', text: `Status: *${e.status}*` });\n\nconst blocks = [\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*${header}*` },\n  },\n];\n\nif (fields.length > 0) {\n  blocks.push({ type: 'section', fields });\n}\n\nblocks.push({\n  type: 'context',\n  elements: [\n    { type: 'mrkdwn', text: `Event \\`${e.eventId}\\` at ${e.receivedAt}` },\n  ],\n});\n\nconst payload = {\n  text: header,  // fallback for notifications\n  attachments: [{ color, blocks }],\n};\n\nreturn [{ json: payload }];"
+      },
+      "id": "stripe-2-build-message",
+      "name": "Build Slack Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_BILLING_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "stripe-3-slack",
+      "name": "Slack Billing Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "stripe-4-respond",
+      "name": "Respond to Stripe",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1640, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback for Slack webhook failures. Log a structured error and respond\n// to Stripe with 200 so Stripe does not retry. (We could also respond 500\n// to trigger Stripe retry, but for Slack-delivery failures we accept the\n// loss and surface it via the n8n execution log + ops alert.)\n\nconst err = ($input.first().json && $input.first().json.error) || {};\nconst event = ($('Normalize Event').first() && $('Normalize Event').first().json) || {};\n\nreturn [{\n  json: {\n    ok: false,\n    fallback: true,\n    eventId: event.eventId || 'unknown',\n    eventType: event.eventType || 'unknown',\n    error: {\n      message: err.message || 'unknown error',\n      name: err.name || 'SlackDeliveryError',\n    },\n    receivedAt: event.receivedAt || new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "stripe-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 360]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, deliveryDeferred: true }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "stripe-err-respond",
+      "name": "Error Respond to Stripe",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1640, 360]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\n- **Verify Stripe Signature (opt-in):** parses `Stripe-Signature` header (`t=<ts>,v1=<hmac>`), checks 5-min replay window, constant-time-compares HMAC-SHA256(rawBody) against `STRIPE_WEBHOOK_SECRET`.\n- **Rate Limit (opt-in):** 60 events / 5 min / customer. Defends against leaked-secret spam.\n- **Idempotency (opt-in):** 24h dedup on Stripe `event.id`. Stripe retries up to 3 days.\n- **Error branch (always on):** Slack delivery failure does not crash the webhook, returns 200 to Stripe so it does not retry, surfaces via n8n logs.",
+        "height": 280,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    }
+  ],
+  "connections": {
+    "Stripe Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Stripe Signature (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Stripe Signature (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Rate Limit (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate Limit (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check (opt-in)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check (opt-in)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Event": {
+      "main": [
+        [
+          {
+            "node": "Build Slack Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Slack Message": {
+      "main": [
+        [
+          {
+            "node": "Slack Billing Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Billing Notification": {
+      "main": [
+        [
+          {
+            "node": "Respond to Stripe",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Fallback": {
+      "main": [
+        [
+          {
+            "node": "Error Respond to Stripe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

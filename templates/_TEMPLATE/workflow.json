@@ -1,0 +1,86 @@
+{
+  "name": "Template Skeleton (rename me)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Template Skeleton\n\nCopy this folder, rename to `templates/NN-your-slug/`, fill in the workflow.json + README.md + cover.md. CI blocks `_TEMPLATE/` itself from validation so you can iterate without breaking the build.\n\nSee `CONTRIBUTING.md` for the full bar.",
+        "height": 200,
+        "width": 380,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "your-trigger",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "tpl-1-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 60],
+      "webhookId": "your-trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Replace with your trigger normalization. Map provider-specific\n// fields to a stable schema the rest of the workflow can rely on.\n\nconst body = $input.first().body || {};\n\nreturn [{ json: {\n  receivedAt: new Date().toISOString(),\n  body,\n} }];"
+      },
+      "id": "tpl-2-normalize",
+      "name": "Normalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "tpl-3-respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [640, 60]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Payload": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

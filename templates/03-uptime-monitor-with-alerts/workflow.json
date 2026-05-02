@@ -1,0 +1,313 @@
+{
+  "name": "Uptime Monitor with Slack and Telegram Alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Uptime Monitor with Alerts\n\nSchedule-driven HTTP health check across multiple targets. Detects state changes (up to down, down to up) and alerts to Slack + Telegram only on transitions, not on every cycle.\n\nNo memory, no LLM. Free to run.",
+        "height": 240,
+        "width": 380,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Set `MONITOR_TARGETS` env var as JSON array, e.g.:\n   `[{\"name\":\"api\",\"url\":\"https://api.example.com/health\",\"expect_status\":200},{\"name\":\"site\",\"url\":\"https://example.com\",\"expect_status\":200}]`\n2. Set `SLACK_OPS_WEBHOOK` for Slack alerts.\n3. Set `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` for Telegram alerts (optional).\n4. Adjust schedule cadence in the Schedule Trigger (default every 5 minutes).",
+        "height": 280,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 200]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "uptime-1-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read targets from MONITOR_TARGETS env. Expected JSON array of:\n//   {name, url, expect_status, timeout_ms?}\n\nconst raw = $env.MONITOR_TARGETS || '[]';\nlet targets;\ntry {\n  targets = JSON.parse(raw);\n} catch (e) {\n  throw new Error('MONITOR_TARGETS env must be valid JSON array, got: ' + raw.slice(0, 100));\n}\n\nif (!Array.isArray(targets) || targets.length === 0) {\n  return [{ json: { skipped: true, reason: 'no targets configured' } }];\n}\n\n// Each target becomes one item in the next node\nreturn targets.map(t => ({ json: {\n  name: t.name || t.url,\n  url: t.url,\n  expectStatus: t.expect_status || 200,\n  timeoutMs: t.timeout_ms || 10000,\n} }));"
+      },
+      "id": "uptime-2-load-targets",
+      "name": "Load Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "options": {
+          "timeout": 10000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 3
+            }
+          }
+        }
+      },
+      "id": "uptime-3-check",
+      "name": "HTTP Health Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 60],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Health check returned 2xx (or matched expected status). State = up.\n\nconst input = $input.first();\nconst target = ($('Load Targets').first() && $('Load Targets').first().json) || {};\nconst statusCode = (input.json && input.json.statusCode) || 200;\n\nreturn [{ json: {\n  name: target.name || 'unknown',\n  url: target.url || 'unknown',\n  state: 'up',\n  statusCode,\n  checkedAt: new Date().toISOString(),\n} }];"
+      },
+      "id": "uptime-4a-up",
+      "name": "Mark Up",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, -60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Health check failed (network error, non-2xx, timeout). State = down.\n\nconst input = $input.first();\nconst target = ($('Load Targets').first() && $('Load Targets').first().json) || {};\nconst err = (input.json && input.json.error) || {};\n\nreturn [{ json: {\n  name: target.name || 'unknown',\n  url: target.url || 'unknown',\n  state: 'down',\n  statusCode: (input.json && input.json.statusCode) || 0,\n  errorMessage: err.message || 'request failed',\n  checkedAt: new Date().toISOString(),\n} }];"
+      },
+      "id": "uptime-4b-down",
+      "name": "Mark Down",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// State-change detection: alert only on transitions.\n// We persist the last known state per target in $getWorkflowStaticData.\n// Same target hitting the same state on 5 consecutive cycles = no alert spam.\n\nconst input = $input.first().json;\nconst data = $getWorkflowStaticData('global');\ndata.lastStates = data.lastStates || {};\nconst lastStates = data.lastStates;\n\nconst key = input.name;\nconst prevState = lastStates[key] || null;\nconst currState = input.state;\n\nlet transition = null;\nif (prevState && prevState !== currState) {\n  transition = `${prevState}-to-${currState}`;\n}\n\nlastStates[key] = currState;\n\nreturn [{ json: {\n  ...input,\n  prevState,\n  transition,\n  shouldAlert: !!transition,\n} }];"
+      },
+      "id": "uptime-5-state-change",
+      "name": "State Change Detector",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.shouldAlert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ]
+        }
+      },
+      "id": "uptime-6-if-alert",
+      "name": "Should Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ($json.state === 'down' ? ':rotating_light: ' : ':white_check_mark: ') + ($json.name || 'target') + ' is now ' + ($json.state || 'unknown').toUpperCase() + ' (was ' + ($json.prevState || 'unknown') + '). URL: ' + ($json.url || '') + ($json.errorMessage ? '. Error: ' + $json.errorMessage : '') }) }}",
+        "options": {}
+      },
+      "id": "uptime-7a-slack",
+      "name": "Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, -60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $env.TELEGRAM_CHAT_ID, text: ($json.state === 'down' ? '🚨 ' : '✅ ') + ($json.name || 'target') + ' is now ' + ($json.state || 'unknown').toUpperCase() + ' (was ' + ($json.prevState || 'unknown') + '). ' + ($json.url || '') + ($json.errorMessage ? ' Error: ' + $json.errorMessage : ''), parse_mode: 'HTML' }) }}",
+        "options": {}
+      },
+      "id": "uptime-7b-telegram",
+      "name": "Telegram Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, 180],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback for alert delivery failure. Log structured error, do not crash workflow.\nconst err = ($input.first().json && $input.first().json.error) || {};\nreturn [{ json: {\n  ok: false,\n  fallback: true,\n  errorMessage: err.message || 'alert delivery failed',\n  errorName: err.name || 'AlertDeliveryError',\n  loggedAt: new Date().toISOString(),\n} }];"
+      },
+      "id": "uptime-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 360]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\n- **Retry-with-backoff:** HTTP Health Check has `retryOnFail=true`, 3 attempts, 2s wait between. Catches transient blips.\n- **State-change-only alerting:** alerts fire on transitions (up to down, down to up), not on every cycle. Persists state in `$getWorkflowStaticData`.\n- **Error branch (always on):** Slack + Telegram delivery failure does not crash workflow. Falls through to structured error log.\n- **Schedule trigger throttle:** built-in. n8n schedule trigger does not retry on missed runs.",
+        "height": 280,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Load Targets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Targets": {
+      "main": [
+        [
+          {
+            "node": "HTTP Health Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Health Check": {
+      "main": [
+        [
+          {
+            "node": "Mark Up",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Down",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Up": {
+      "main": [
+        [
+          {
+            "node": "State Change Detector",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Down": {
+      "main": [
+        [
+          {
+            "node": "State Change Detector",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "State Change Detector": {
+      "main": [
+        [
+          {
+            "node": "Should Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Alert?": {
+      "main": [
+        [
+          {
+            "node": "Slack Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Telegram Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Alert": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Alert": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

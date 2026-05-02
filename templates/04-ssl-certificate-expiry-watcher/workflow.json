@@ -1,0 +1,217 @@
+{
+  "name": "SSL Certificate Expiry Watcher (Three-Tier Alerts)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SSL Certificate Expiry Watcher\n\nDaily TLS check across multiple domains. Three-tier alert: warning (<30 days), urgent (<14 days), critical (<7 days). Slack post per affected domain, only when threshold is crossed.\n\nNo memory, no LLM, no webhook. Free to run.",
+        "height": 240,
+        "width": 380,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Set `SSL_DOMAINS` env var, comma-separated list (e.g. `example.com,api.example.com,studiomeyer.io`).\n2. Set `SLACK_OPS_WEBHOOK` for alerts.\n3. Adjust schedule (default daily 09:00 UTC).\n4. Adjust thresholds in `Check Expiry` Code node (default 30 / 14 / 7 days).",
+        "height": 240,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 200]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "ssl-1-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read domains from SSL_DOMAINS env (comma-separated). Emit one item per domain.\n\nconst raw = $env.SSL_DOMAINS || '';\nconst domains = raw.split(',').map(d => d.trim()).filter(Boolean);\n\nif (domains.length === 0) {\n  return [{ json: { skipped: true, reason: 'no domains configured' } }];\n}\n\nreturn domains.map(d => ({ json: { domain: d } }));"
+      },
+      "id": "ssl-2-load-domains",
+      "name": "Load Domains",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// TLS-connect to the domain, read the peer certificate, compute days_until_expiry.\n// Three-tier alert: warning (<30 days), urgent (<14 days), critical (<7 days).\n//\n// Default rejectUnauthorized=true (CA-validated). Set\n// SSL_ACCEPT_SELFSIGNED=1 to opt in to inspecting self-signed / chain-broken\n// certs (useful for staging or internal mTLS endpoints where you want to\n// monitor expiry even if the cert chain does not validate).\n\nconst tls = require('tls');\n\nconst domain = $input.first().json.domain;\nconst host = domain.replace(/^https?:\\/\\//, '').split('/')[0].split(':')[0];\nconst port = 443;\nconst acceptSelfSigned = $env.SSL_ACCEPT_SELFSIGNED === '1';\n\nfunction connect() {\n  return new Promise((resolve, reject) => {\n    const socket = tls.connect({\n      host,\n      port,\n      servername: host,\n      timeout: 10000,\n      rejectUnauthorized: !acceptSelfSigned,\n    }, () => {\n      const cert = socket.getPeerCertificate();\n      socket.end();\n      if (!cert || !cert.valid_to) {\n        reject(new Error('No peer certificate or no valid_to'));\n      } else {\n        resolve(cert);\n      }\n    });\n    socket.on('error', reject);\n    socket.on('timeout', () => {\n      socket.destroy();\n      reject(new Error('TLS connection timeout'));\n    });\n  });\n}\n\nlet cert;\ntry {\n  cert = await connect();\n} catch (e) {\n  return [{ json: {\n    domain,\n    host,\n    error: true,\n    errorMessage: e.message,\n    severity: 'error',\n    shouldAlert: true,\n    checkedAt: new Date().toISOString(),\n  } }];\n}\n\nconst expiryDate = new Date(cert.valid_to);\nconst now = Date.now();\nconst daysLeft = Math.floor((expiryDate.getTime() - now) / (1000 * 60 * 60 * 24));\n\nlet severity = 'ok';\nlet shouldAlert = false;\nif (daysLeft < 7) { severity = 'critical'; shouldAlert = true; }\nelse if (daysLeft < 14) { severity = 'urgent'; shouldAlert = true; }\nelse if (daysLeft < 30) { severity = 'warning'; shouldAlert = true; }\n\nreturn [{ json: {\n  domain,\n  host,\n  daysLeft,\n  expiryDate: expiryDate.toISOString().slice(0, 10),\n  issuer: (cert.issuer && cert.issuer.O) || 'unknown',\n  subject: (cert.subject && cert.subject.CN) || host,\n  severity,\n  shouldAlert,\n  checkedAt: new Date().toISOString(),\n} }];"
+      },
+      "id": "ssl-3-check",
+      "name": "Check Expiry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 60]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.shouldAlert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ]
+        }
+      },
+      "id": "ssl-4-if-alert",
+      "name": "Should Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [840, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a severity-coded Slack Block Kit message.\n\nconst e = $input.first().json;\n\nconst emoji = {\n  warning: ':warning:',\n  urgent: ':alarm_clock:',\n  critical: ':rotating_light:',\n  error: ':boom:',\n}[e.severity] || ':bell:';\n\nconst color = {\n  warning: '#daa038',\n  urgent: '#d93f0b',\n  critical: '#a30200',\n  error: '#666666',\n}[e.severity] || '#666666';\n\nconst headline = e.error\n  ? `${emoji} SSL check failed for ${e.domain}: ${e.errorMessage || 'unknown error'}`\n  : `${emoji} ${e.severity.toUpperCase()}: ${e.domain} expires in ${e.daysLeft} days`;\n\nconst blocks = [\n  { type: 'section', text: { type: 'mrkdwn', text: `*${headline}*` } },\n];\n\nif (!e.error) {\n  blocks.push({\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `Expires: *${e.expiryDate}*` },\n      { type: 'mrkdwn', text: `Issuer: *${e.issuer}*` },\n      { type: 'mrkdwn', text: `Days left: *${e.daysLeft}*` },\n      { type: 'mrkdwn', text: `Subject: *${e.subject}*` },\n    ],\n  });\n}\n\nblocks.push({\n  type: 'context',\n  elements: [{ type: 'mrkdwn', text: `Checked at ${e.checkedAt}` }],\n});\n\nreturn [{ json: {\n  text: headline,\n  attachments: [{ color, blocks }],\n} }];"
+      },
+      "id": "ssl-5-build-message",
+      "name": "Build Slack Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, -60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "ssl-6-slack",
+      "name": "Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, -60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback for Slack delivery failure. Log structured error.\nconst err = ($input.first().json && $input.first().json.error) || {};\nreturn [{ json: {\n  ok: false,\n  fallback: true,\n  errorMessage: err.message || 'slack delivery failed',\n  loggedAt: new Date().toISOString(),\n} }];"
+      },
+      "id": "ssl-err-fallback",
+      "name": "Error Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 200]
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\n- **Schedule throttle (built-in):** daily cron, no missed-run backfill.\n- **Three-tier alerting:** warning <30d, urgent <14d, critical <7d. Per-domain severity gates downstream alerts.\n- **TLS-error path:** if `tls.connect` itself fails, severity is `error` and the alert message includes the network error message.\n- **Error branch (always on):** Slack delivery failure does not crash workflow. Falls through to structured error log.",
+        "height": 280,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Load Domains",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Domains": {
+      "main": [
+        [
+          {
+            "node": "Check Expiry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Expiry": {
+      "main": [
+        [
+          {
+            "node": "Should Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Alert?": {
+      "main": [
+        [
+          {
+            "node": "Build Slack Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Slack Message": {
+      "main": [
+        [
+          {
+            "node": "Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Alert": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Error Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

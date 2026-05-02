@@ -1,0 +1,182 @@
+name: Validate Workflows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'templates/**/*.json'
+      - 'templates/**/*.md'
+      - 'examples/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'PRODUCTION_CHECKLIST.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CODE_OF_CONDUCT.md'
+      - 'ECOSYSTEM.md'
+      - 'STATUS.md'
+      - '.github/workflows/validate-workflows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'templates/**/*.json'
+      - 'templates/**/*.md'
+      - 'examples/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'PRODUCTION_CHECKLIST.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CODE_OF_CONDUCT.md'
+      - 'ECOSYSTEM.md'
+      - 'STATUS.md'
+      - '.github/workflows/validate-workflows.yml'
+
+jobs:
+  validate:
+    name: Validate workflow.json files
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate every workflow.json
+        run: |
+          set -e
+          fail=0
+          for wf in templates/*/workflow.json; do
+            # Skip the skeleton template
+            case "$wf" in
+              templates/_TEMPLATE/*) continue ;;
+            esac
+
+            echo "::group::$wf"
+            node -e "
+              const fs = require('fs');
+              const w = JSON.parse(fs.readFileSync('$wf', 'utf8'));
+              const names = new Set(w.nodes.map(n => n.name));
+              const missing = [];
+              for (const [from, ports] of Object.entries(w.connections || {})) {
+                if (!names.has(from)) missing.push('FROM ' + from);
+                for (const port of ports.main || []) {
+                  for (const link of port || []) {
+                    if (link && !names.has(link.node)) missing.push('TO ' + link.node);
+                  }
+                }
+              }
+              const requiredKeys = ['name', 'nodes', 'connections', 'settings'];
+              const missingKeys = requiredKeys.filter(k => !(k in w));
+              if (missingKeys.length || missing.length) {
+                console.error('FAIL: missing keys=' + JSON.stringify(missingKeys) + ' missing refs=' + JSON.stringify(missing));
+                process.exit(1);
+              }
+              if (w.active === true) {
+                console.error('FAIL: workflow.json has active=true (must be omitted or false at commit time)');
+                process.exit(1);
+              }
+              if (w.pinData && Object.keys(w.pinData).length > 0) {
+                console.error('FAIL: workflow.json has non-empty pinData (strip test data before commit)');
+                process.exit(1);
+              }
+              // Forbidden top-level keys: n8n Public API rejects these
+              // on POST /api/v1/workflows so they must not appear in the committed
+              // template JSON. Strip them before commit.
+              const forbidden = ['meta', 'staticData', 'versionId', 'id', 'tags'];
+              const present = forbidden.filter(k => k in w);
+              if (present.length > 0) {
+                console.error('FAIL: workflow.json has forbidden top-level keys: ' + present.join(', '));
+                console.error('  n8n Public API rejects these on POST. Strip before commit.');
+                process.exit(1);
+              }
+              console.log('OK: nodes=' + w.nodes.length + ', connections=' + Object.keys(w.connections || {}).length);
+            " || fail=1
+            echo "::endgroup::"
+          done
+          if [ $fail -eq 1 ]; then
+            echo "Validation failed for at least one workflow.json"
+            exit 1
+          fi
+
+      - name: Credential-leak scan (workflow.json)
+        run: |
+          # Block workflow.json files that ship with real credentials baked in.
+          # Builders attach credentials in n8n after import via the credentials
+          # store. A workflow.json with `credentials: {<credType>: {id: "...", name: "..."}}`
+          # is fine (those are credential-store references, not secrets).
+          # What we block: literal API keys, OAuth tokens, basic-auth pairs.
+          set -e
+          fail=0
+          for wf in templates/*/workflow.json; do
+            case "$wf" in
+              templates/_TEMPLATE/*) continue ;;
+            esac
+            # Pattern 1: literal apiKey/accessToken/refreshToken values that look like real keys
+            #   (32+ char hex/base64, sk-/pk-/Bearer prefixes, JWT-shape, etc.)
+            # Pattern 2: hardcoded passwords/tokens not behind a credential-store reference
+            leak=$(grep -nEi '"(apiKey|accessToken|refreshToken|password|secret|token)"\s*:\s*"(sk-[A-Za-z0-9_-]{20,}|pk-[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9_.-]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|[A-Fa-f0-9]{32,}|[A-Za-z0-9+/]{40,}={0,2})"' "$wf" 2>/dev/null || true)
+            if [ -n "$leak" ]; then
+              echo "::error file=$wf::FAIL: workflow.json appears to contain real credentials"
+              echo "$leak"
+              echo "  Strip before commit. Builders attach credentials in n8n after import."
+              fail=1
+            fi
+          done
+          if [ $fail -eq 1 ]; then
+            echo "Credential-leak scan failed for at least one workflow.json"
+            exit 1
+          fi
+          echo "OK: no credential leaks detected"
+
+      - name: Em-dash guard
+        run: |
+          # Em-dashes (U+2014) are AI-content signature and forbidden in markdown + workflow.json.
+          # Covers: templates/ (excluding _TEMPLATE skeleton), examples/, all root-level
+          # markdown files, and other CI workflow files. The skeleton _TEMPLATE/ is excluded
+          # because it contains placeholder em-dashes intentionally as part of the
+          # "what NOT to do" reminder for contributors. validate-workflows.yml itself
+          # is also excluded (referencing the U+2014 codepoint via $EMDASH below means
+          # the literal byte does not appear in this file's text).
+          set -e
+          EMDASH=$(printf '\xe2\x80\x94')
+          fail=0
+
+          found_templates=$(grep -rln "$EMDASH" templates/ --include="*.md" --include="*.json" --exclude-dir=_TEMPLATE 2>/dev/null || true)
+          if [ -n "$found_templates" ]; then
+            echo "FAIL: em-dash (U+2014) found in templates/:"
+            echo "$found_templates"
+            fail=1
+          fi
+
+          # Root-level markdown + examples/
+          for f in README.md CHANGELOG.md PRODUCTION_CHECKLIST.md CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md ECOSYSTEM.md STATUS.md; do
+            if [ -f "$f" ] && grep -q "$EMDASH" "$f"; then
+              echo "FAIL: em-dash (U+2014) found in $f"
+              fail=1
+            fi
+          done
+
+          for f in examples/*.md examples/*.json; do
+            if [ -f "$f" ] && grep -q "$EMDASH" "$f"; then
+              echo "FAIL: em-dash (U+2014) found in $f"
+              fail=1
+            fi
+          done
+
+          for f in .github/workflows/smoke-test-snippets.yml; do
+            if [ -f "$f" ] && grep -q "$EMDASH" "$f"; then
+              echo "FAIL: em-dash (U+2014) found in $f"
+              fail=1
+            fi
+          done
+
+          if [ $fail -eq 1 ]; then
+            echo ""
+            echo "Replace em-dashes with comma, period, or parenthesis."
+            exit 1
+          fi
+          echo "OK: no em-dashes in templates/, examples/, root markdown, or peer CI workflows"

@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+.env
+.env.local
+*.log
+.vscode/
+.idea/
+
+# Don't commit user-pinned test data
+*.pinData.json

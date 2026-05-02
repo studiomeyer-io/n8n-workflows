@@ -1,0 +1,453 @@
+{
+  "name": "Slack Channel Daily Digest (Multi-Provider LLM)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Slack Channel Daily Digest\n\nFetches the last 24h of messages from a Slack channel, summarizes via OpenAI (default) or Anthropic, posts a digest back to a target channel + emails the team.\n\nMulti-provider LLM switch with fallback discrimination so router-fallback does not leak the prompt into the audit trail.",
+        "height": 240,
+        "width": 380,
+        "color": 6
+      },
+      "id": "note-intro",
+      "name": "Sticky Note - Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -100]
+    },
+    {
+      "parameters": {
+        "content": "### >> SET ME <<\n\n1. Set `SLACK_SOURCE_CHANNEL` (channel ID to read messages from, e.g. `C01ABCDE`).\n2. Set `SLACK_DIGEST_CHANNEL` (channel ID to post the digest to).\n3. Set `SLACK_DIGEST_PROVIDER` to `openai` (default) or `anthropic`.\n4. Add Slack OAuth credential with `channels:history`, `chat:write`, `groups:history` scopes.\n5. Add OpenAI or Anthropic credential.\n6. Set `DIGEST_EMAIL_TO` (optional, comma-separated).\n7. Adjust schedule (default daily 18:00 UTC).",
+        "height": 320,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-setup",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 220]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 18 * * *"
+            }
+          ]
+        }
+      },
+      "id": "digest-1-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute the time window (last 24h, Slack uses Unix timestamp seconds with microsecond suffix).\n\nconst now = Math.floor(Date.now() / 1000);\nconst oldest = now - 24 * 60 * 60;\n\nreturn [{ json: {\n  oldest: String(oldest),\n  latest: String(now),\n  windowHours: 24,\n  channel: $env.SLACK_SOURCE_CHANNEL,\n  digestChannel: $env.SLACK_DIGEST_CHANNEL,\n  provider: ($env.SLACK_DIGEST_PROVIDER || 'openai').toLowerCase(),\n} }];"
+      },
+      "id": "digest-2-window",
+      "name": "Compute Time Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 60]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://slack.com/api/conversations.history",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "channel",
+              "value": "={{ $json.channel }}"
+            },
+            {
+              "name": "oldest",
+              "value": "={{ $json.oldest }}"
+            },
+            {
+              "name": "latest",
+              "value": "={{ $json.latest }}"
+            },
+            {
+              "name": "limit",
+              "value": "200"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.slackApi.accessToken }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "digest-3-fetch",
+      "name": "Slack: Fetch History",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reduce the Slack history payload into a compact text-only conversation log\n// the LLM can summarize. Drops bot messages, threads, file uploads.\n\nconst input = $input.first().json;\n\nif (!input.ok) {\n  throw new Error('Slack API error: ' + (input.error || 'unknown'));\n}\n\nconst messages = (input.messages || [])\n  .filter(m => m.type === 'message')\n  .filter(m => !m.subtype || ['thread_broadcast'].includes(m.subtype))\n  .filter(m => m.text && m.text.length > 5);\n\nif (messages.length === 0) {\n  return [{ json: { skipped: true, reason: 'no messages in window' } }];\n}\n\n// Reverse chronological order from Slack, flip to oldest-first for the LLM\nconst sorted = [...messages].sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));\n\n// Compact text format: <user-id>: <text>\nconst transcript = sorted.map(m => {\n  const user = m.user || 'unknown';\n  const text = (m.text || '').replace(/<@[A-Z0-9]+>/g, '@user').replace(/<#[A-Z0-9]+\\|([^>]+)>/g, '#$1');\n  return `${user}: ${text}`;\n}).join('\\n');\n\n// Token-cap: rough rule, 4 chars per token, keep under 6000 tokens for the LLM\nconst MAX_CHARS = 24000;\nconst capped = transcript.length > MAX_CHARS\n  ? '... (older messages truncated) ...\\n' + transcript.slice(-MAX_CHARS)\n  : transcript;\n\nconst window = ($('Compute Time Window').first() && $('Compute Time Window').first().json) || {};\n\nreturn [{ json: {\n  messageCount: sorted.length,\n  transcript: capped,\n  window: {\n    hours: window.windowHours || 24,\n    digestChannel: window.digestChannel,\n  },\n  provider: window.provider || 'openai',\n} }];"
+      },
+      "id": "digest-4-build-transcript",
+      "name": "Build Transcript",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the LLM prompt. System prompt encourages bullet-style summary,\n// no marketing fluff, factual.\n\nconst input = $input.first().json;\n\nconst systemPrompt = [\n  'You are a digest writer. Read the team chat transcript below and produce a short summary.',\n  'Format: 4-7 bullet points, factual, mention names of people involved per topic.',\n  'No marketing language. No filler. No headers. No emoji unless one is in the transcript.',\n  'If the transcript is mostly noise (greetings, no decisions), say so in one sentence.',\n].join(' ');\n\nconst userPrompt = `Last ${input.window.hours}h chat. ${input.messageCount} messages.\\n\\n${input.transcript}\\n\\nWrite the digest now.`;\n\nreturn [{ json: {\n  ...input,\n  systemPrompt,\n  userPrompt,\n} }];"
+      },
+      "id": "digest-5-build-prompt",
+      "name": "Build LLM Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 60]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.provider }}",
+                    "rightValue": "openai",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "openai"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.provider }}",
+                    "rightValue": "anthropic",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "anthropic"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "digest-6-route",
+      "name": "Route by Provider",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1240, 60]
+    },
+    {
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-5.4-mini",
+          "mode": "list"
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "={{ $json.systemPrompt }}"
+            },
+            {
+              "role": "user",
+              "content": "={{ $json.userPrompt }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "id": "digest-7a-openai",
+      "name": "OpenAI Reply",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.8,
+      "position": [1440, -100],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": {
+          "__rl": true,
+          "value": "claude-haiku-4-5",
+          "mode": "list"
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "={{ $json.userPrompt }}"
+            }
+          ]
+        },
+        "options": {
+          "system": "={{ $json.systemPrompt }}",
+          "maxTokens": 1024
+        }
+      },
+      "id": "digest-7b-anthropic",
+      "name": "Anthropic Reply",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [1440, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize the LLM response shape. OpenAI returns {choices:[{message:{content}}]},\n// Anthropic returns {content:[{type:'text',text}]}.\n\nconst input = $input.first().json;\n\nlet replyText = '';\nif (input.choices && input.choices[0] && input.choices[0].message) {\n  replyText = input.choices[0].message.content || '';\n} else if (input.content && Array.isArray(input.content) && input.content[0]) {\n  replyText = input.content[0].text || '';\n} else if (input.text) {\n  replyText = input.text;\n} else {\n  replyText = '(no reply)';\n}\n\nconst window = ($('Build Transcript').first() && $('Build Transcript').first().json) || {};\n\nreturn [{ json: {\n  digest: replyText,\n  messageCount: window.messageCount || 0,\n  digestChannel: (window.window && window.window.digestChannel) || $env.SLACK_DIGEST_CHANNEL,\n  generatedAt: new Date().toISOString(),\n} }];"
+      },
+      "id": "digest-8-normalize",
+      "name": "Normalize LLM Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, -20]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Discriminate between LLM-error and Router-fallback so the structured error\n// log this Code node emits does not leak the system prompt + transcript.\n//\n// Router-fallback = unknown provider value (typo, env var not set). The Code\n// node here emits a clear diagnostic without serializing $json.\n// LLM-error = the OpenAI / Anthropic Reply node failed (rate limit, 5xx,\n// timeout). The Code node here emits err.message + err.httpCode but does NOT\n// echo the prompt back.\n//\n// IMPORTANT scoping: this discriminator only protects what THIS Code node\n// writes. n8n's execution-data store still has the upstream nodes' input pins\n// (including systemPrompt + transcript) unless you set workflow Settings to\n// `Save Execution Progress: errored only` and apply your own redaction\n// policy. Do that on the operator side for full prompt-privacy.\n\nconst input = $input.first();\nconst err = (input.json && input.json.error) || {};\nconst httpCode = err.httpCode || (err.response && err.response.status) || null;\n\n// Tight regex: 429 / 5xx / timeout / connection-reset / abort. Avoids the\n// false-positive of literally matching the digit '5' anywhere in err.message.\nconst llmErrorRe = /^(429|5\\d\\d)\\b|\\b(timeout|ECONNRESET|ECONNABORTED|ETIMEDOUT|abort)\\b/i;\nconst isHttp5xxOr429 = httpCode === 429 || (httpCode >= 500 && httpCode < 600);\nconst isLlmError = isHttp5xxOr429 || (err.message && llmErrorRe.test(err.message))\n  || err.name === 'AxiosError' || err.name === 'NodeApiError';\nconst isRouterFallback = !isLlmError && (!err || !err.message);\n\nconst window = ($('Build Transcript').first() && $('Build Transcript').first().json) || {};\nconst originalProvider = window.provider || 'unknown';\n\nlet diagnostic;\nlet errorClass;\nif (isRouterFallback) {\n  diagnostic = `Unknown provider value: \"${originalProvider}\". Set SLACK_DIGEST_PROVIDER to openai or anthropic.`;\n  errorClass = 'router-fallback';\n} else {\n  // Log only the LLM-side error message, never the prompt or transcript.\n  diagnostic = (err.message || 'LLM call failed').slice(0, 240);\n  errorClass = 'llm-error';\n}\n\nreturn [{ json: {\n  digest: '(digest could not be generated)',\n  fallback: true,\n  errorClass,\n  diagnostic,\n  httpCode,\n  provider: originalProvider,\n  messageCount: window.messageCount || 0,\n  digestChannel: (window.window && window.window.digestChannel) || $env.SLACK_DIGEST_CHANNEL,\n  generatedAt: new Date().toISOString(),\n} }];"
+      },
+      "id": "digest-9-fallback",
+      "name": "LLM Fallback Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.slackApi.accessToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ channel: $json.digestChannel, text: ':newspaper: *Daily Digest*\\n' + ($json.digest || '(no content)'), unfurl_links: false, unfurl_media: false }) }}",
+        "options": {}
+      },
+      "id": "digest-10-slack-post",
+      "name": "Post Digest to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 60],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Production Patterns\n\n- **Multi-provider LLM Switch:** OpenAI default, Anthropic optional. Router-fallback discriminates the LLM-error path from the typo-fallback path so the audit trail does not leak the full system prompt + transcript.\n- **Token cap on transcript:** 24000 chars (~6000 tokens) hard cap. Older messages truncated with a marker.\n- **Schedule throttle:** built-in.\n- **Error branch (always on):** Slack post failure does not crash workflow, surfaces via n8n logs.",
+        "height": 280,
+        "width": 380,
+        "color": 7
+      },
+      "id": "note-production-patterns",
+      "name": "Sticky Note - Production Patterns",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, -260]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Compute Time Window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Time Window": {
+      "main": [
+        [
+          {
+            "node": "Slack: Fetch History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Fetch History": {
+      "main": [
+        [
+          {
+            "node": "Build Transcript",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "LLM Fallback Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Transcript": {
+      "main": [
+        [
+          {
+            "node": "Build LLM Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build LLM Prompt": {
+      "main": [
+        [
+          {
+            "node": "Route by Provider",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Provider": {
+      "main": [
+        [
+          {
+            "node": "OpenAI Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Anthropic Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "LLM Fallback Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Reply": {
+      "main": [
+        [
+          {
+            "node": "Normalize LLM Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "LLM Fallback Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Reply": {
+      "main": [
+        [
+          {
+            "node": "Normalize LLM Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "LLM Fallback Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize LLM Output": {
+      "main": [
+        [
+          {
+            "node": "Post Digest to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Fallback Reply": {
+      "main": [
+        [
+          {
+            "node": "Post Digest to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
