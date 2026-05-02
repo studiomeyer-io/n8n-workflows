@@ -29,6 +29,10 @@ The result is a router that gives you per-lead temperature classification and pe
 [Idempotency Check (opt-in)]         ← IDEMPOTENCY_ENABLED=1, dedup on submission_id || email + minute-bucket
     │
     ▼
+[Skip If Duplicate]   IF gateway on $json.skipped===true
+    ├──── true ────► [Respond Duplicate]   200 OK + {deduped: true}
+    │
+    ▼ false (live)
 [Normalize Payload]                  ← maps Webflow / Tally / Typeform field names to a stable schema
     │
     ▼
@@ -119,7 +123,7 @@ Per-execution cost: $0. The workflow makes one CRM API call + one Slack call. Bo
 
 Four patterns ship as actual nodes in `workflow.json`. Three opt-in via env vars and one always-on error branch.
 
-**Idempotency** (opt-in, `IDEMPOTENCY_ENABLED=1`). The `Idempotency Check` Code node holds a 5-minute in-memory window of seen submission IDs (or email + minute-bucket if no submission ID is provided) via `$getWorkflowStaticData('global')`. Form providers retry on 5xx. Without dedup, every retry creates a duplicate deal in your CRM and a duplicate Slack notification. Default-off so the import boots clean. For clustered n8n, swap to Redis `SET NX EX 300`. Snippet in the node's comments.
+**Idempotency** (opt-in, `IDEMPOTENCY_ENABLED=1`). The `Idempotency Check` Code node holds a 5-minute in-memory window of seen submission IDs (or email + minute-bucket if no submission ID is provided) via `$getWorkflowStaticData('global')`. Form providers retry on 5xx. Without dedup, every retry creates a duplicate deal in your CRM and a duplicate Slack notification. Default-off so the import boots clean. On a duplicate the Idempotency Check emits a `{ skipped: true, reason: 'duplicate' }` sentinel that the `Skip If Duplicate` IF node routes to a dedicated `Respond Duplicate` `respondToWebhook` node returning 200 OK + `{ ok: true, deduped: true }`. Without that gateway, an `responseMode: responseNode` webhook would hold the connection open for 30 seconds on every duplicate and the source provider would log delivery failed. For clustered n8n, swap to Redis `SET NX EX 300`. Snippet in the node's comments.
 
 **Rate limiting** (opt-in, `RATE_LIMIT_ENABLED=1`). Per-IP sliding window. 60 requests per 5 minutes per IP. Map bounded at 5000 entries with eviction. Defense-in-depth, not the primary control. For real production loads, put the limit on a reverse proxy (Nginx `limit_req_zone`, Cloudflare WAF, Traefik).
 

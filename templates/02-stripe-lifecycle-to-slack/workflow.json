@@ -185,7 +185,7 @@
     },
     {
       "parameters": {
-        "content": "## Production Patterns\n\n- **Verify Stripe Signature (opt-in):** parses `Stripe-Signature` header (`t=<ts>,v1=<hmac>`), checks 5-min replay window, constant-time-compares HMAC-SHA256(rawBody) against `STRIPE_WEBHOOK_SECRET`.\n- **Rate Limit (opt-in):** 60 events / 5 min / customer. Defends against leaked-secret spam.\n- **Idempotency (opt-in):** 24h dedup on Stripe `event.id`. Stripe retries up to 3 days.\n- **Error branch (always on):** Slack delivery failure does not crash the webhook, returns 200 to Stripe so it does not retry, surfaces via n8n logs.",
+        "content": "## Production Patterns\n\n- **Verify Stripe Signature (opt-in):** parses `Stripe-Signature` header (`t=<ts>,v1=<hmac>`), checks 5-min replay window, constant-time-compares HMAC-SHA256(rawBody) against `STRIPE_WEBHOOK_SECRET`.\n- **Rate Limit (opt-in):** 60 events / 5 min / customer. Defends against leaked-secret spam.\n- **Idempotency (opt-in):** 24h dedup on Stripe `event.id`. Stripe retries up to 3 days. On duplicate the Idempotency Check emits a `{ skipped: true }` sentinel that the `Skip If Duplicate` IF node routes to the dedicated `Respond Duplicate` `respondToWebhook` node (200 OK + `{ deduped: true }`). Stripe sees a clean 200 instead of a 30s connection-hang, no \"delivery failed\" alerts.\n- **Error branch (always on):** Slack delivery failure does not crash the webhook, returns 200 to Stripe so it does not retry, surfaces via n8n logs.",
         "height": 280,
         "width": 380,
         "color": 7

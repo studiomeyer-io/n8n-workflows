@@ -426,7 +426,7 @@
     },
     {
       "parameters": {
-        "content": "## Production Patterns\n\nFour patterns wired as opt-in nodes. Default-off via env vars so import boots clean.\n\n- **HMAC verify:** `LEAD_FORM_SIGNING_SECRET` + `WEBHOOK_INTEGRITY_CHECK_ENABLED=1`\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 req / 5 min / IP)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (5-min window on submission ID)\n- **Error branch:** always on. Every HTTP node has `onError: continueErrorOutput` wired to the Error Fallback Code node.\n\nFor clustered n8n, swap the in-memory dedup for Redis SET NX EX 300. Snippet in each opt-in node's comments.",
+        "content": "## Production Patterns\n\nFour patterns wired as opt-in nodes. Default-off via env vars so import boots clean.\n\n- **HMAC verify:** `LEAD_FORM_SIGNING_SECRET` + `WEBHOOK_INTEGRITY_CHECK_ENABLED=1`\n- **Rate limit:** `RATE_LIMIT_ENABLED=1` (60 req / 5 min / IP)\n- **Idempotency:** `IDEMPOTENCY_ENABLED=1` (5-min window on submission ID)\n- **Error branch:** always on. Every HTTP node has `onError: continueErrorOutput` wired to the Error Fallback Code node.\n\n- **Respond-duplicate gateway:** when the Idempotency Check detects a duplicate it emits a `{ skipped: true }` sentinel that the `Skip If Duplicate` IF node routes to the dedicated `Respond Duplicate` `respondToWebhook` node (200 OK + `{ ok: true, deduped: true }`). This avoids the 30s connection-hang that would otherwise occur on `responseMode: responseNode` if the duplicate path returned `[]` and never reached a respond node.\n\nFor clustered n8n, swap the in-memory dedup for Redis SET NX EX 300. Snippet in each opt-in node's comments.",
         "height": 320,
         "width": 380,
         "color": 7

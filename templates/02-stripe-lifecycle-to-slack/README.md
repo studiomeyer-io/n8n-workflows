@@ -29,6 +29,10 @@ The result is a billing channel in Slack that does not miss events, does not dup
 [Idempotency Check (opt-in)]         ← IDEMPOTENCY_ENABLED=1, 24h dedup on event.id
     │
     ▼
+[Skip If Duplicate]   IF gateway on $json.skipped===true
+    ├──── true ────► [Respond Duplicate]   200 OK + {deduped: true}
+    │
+    ▼ false (live)
 [Normalize Event]                    ← extracts customer, amount, plan, status across event types
     │
     ▼
@@ -90,7 +94,7 @@ Four patterns ship as actual nodes in `workflow.json`. Three opt-in via env vars
 
 **Rate limiting** (opt-in, `RATE_LIMIT_ENABLED=1`). Per-customer sliding window. 60 events per 5 minutes per customer. Defends against a leaked signing secret being used to spam events for one customer. Map bounded at 5000 entries with eviction.
 
-**Idempotency** (opt-in, `IDEMPOTENCY_ENABLED=1`). 24-hour dedup on Stripe `event.id`. Stripe retries failed deliveries up to 3 days, the 24h window covers the typical retry pattern without unbounded memory growth.
+**Idempotency** (opt-in, `IDEMPOTENCY_ENABLED=1`). 24-hour dedup on Stripe `event.id`. Stripe retries failed deliveries up to 3 days, the 24h window covers the typical retry pattern without unbounded memory growth. On a duplicate the Idempotency Check emits a `{ skipped: true, reason: 'duplicate' }` sentinel that the `Skip If Duplicate` IF node routes to a dedicated `Respond Duplicate` `respondToWebhook` node (200 OK + `{ ok: true, deduped: true }`). This avoids the 30-second connection-hang that would otherwise occur on `responseMode: responseNode` if the duplicate path returned `[]` and never reached a respond node, and stops Stripe from logging "delivery failed" on every retry.
 
 **Error branches** (always on). Slack Billing Notification has `On Error: Continue (Using Error Output)` enabled. The error pin lands at `Error Fallback` which builds a structured error log and feeds `Error Respond to Stripe` so the webhook returns 200 (Stripe does not retry on 200). The Slack delivery failure surfaces via the n8n execution log instead. If you would rather have Stripe retry on Slack failures, change the response code to 500.
 

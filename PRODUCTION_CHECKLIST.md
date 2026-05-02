@@ -128,7 +128,7 @@ For each template you flip to production, wire one of these observability hooks:
 2. Configure the credentials per template README.
 3. Send the example payload from `examples/` via curl or Postman.
 4. Verify the expected output (Slack message, CRM record, alert, etc).
-5. Send the example payload again. Verify the idempotency dedup fires (second call short-circuits without producing a duplicate output).
+5. Send the example payload again. Verify the idempotency dedup fires. On webhook-trigger templates (T01, T02, T06, T07, T10) the second call returns HTTP 200 with body `{ "ok": true, "deduped": true, "reason": "duplicate" }` from the dedicated `Respond Duplicate` node, and no downstream Slack / CRM / Tracker side-effect is produced. If you see a 30-second connection-hang or "delivery failed" alert on the source provider, the IF gateway is missing or mis-wired, see the v0.3.1 changelog.
 6. Send a payload with a wrong HMAC. Verify the Verify Webhook node rejects with HTTP 401.
 7. Send 70 payloads in 5 minutes. Verify the Rate Limit node rejects after 60 with HTTP 429.
 8. Cause an error in the downstream API (drop credentials, point at a wrong URL). Verify the error branch fires and the fallback path produces a graceful response.

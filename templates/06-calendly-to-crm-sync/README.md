@@ -29,6 +29,10 @@ The result is a router that turns booked meetings into qualified pipeline record
 [Idempotency Check (opt-in)]         <- IDEMPOTENCY_ENABLED=1, dedup on event.uri
     |
     v
+[Skip If Duplicate]   IF gateway on $json.skipped===true
+    +---- true ----> [Respond Duplicate]   200 OK + {deduped: true}
+    |
+    v false (live)
 [Normalize Payload]                  <- maps Calendly v2 nested shape into stable schema
     |
     v
@@ -108,7 +112,7 @@ Per-execution cost: **$0**. The workflow makes one CRM API call + one Slack call
 
 Four patterns ship as actual nodes in `workflow.json`. Three opt-in via env vars and one always-on error branch.
 
-**Idempotency** (opt-in, `IDEMPOTENCY_ENABLED=1`). The `Idempotency Check` Code node holds a 5-minute in-memory window of seen `event.uri` values via `$getWorkflowStaticData('global')`. Calendly retries on 5xx for up to 24 hours, but a 5-minute window catches the storm of retries that follow a recovery and the longer-tail late retries usually arrive after the first successful processing. For clustered n8n, swap to Redis `SET NX EX 300`. Snippet in the node's comments.
+**Idempotency** (opt-in, `IDEMPOTENCY_ENABLED=1`). The `Idempotency Check` Code node holds a 5-minute in-memory window of seen `event.uri` values via `$getWorkflowStaticData('global')`. Calendly retries on 5xx for up to 24 hours, but a 5-minute window catches the storm of retries that follow a recovery and the longer-tail late retries usually arrive after the first successful processing. On a duplicate the Idempotency Check emits a `{ skipped: true, reason: 'duplicate' }` sentinel that the `Skip If Duplicate` IF node routes to a dedicated `Respond Duplicate` `respondToWebhook` node returning 200 OK + `{ ok: true, deduped: true }`. Without that gateway, an `responseMode: responseNode` webhook would hold the connection open for 30 seconds on every duplicate and the source provider would log delivery failed. For clustered n8n, swap to Redis `SET NX EX 300`. Snippet in the node's comments.
 
 **Rate limiting** (opt-in, `RATE_LIMIT_ENABLED=1`). Per-IP sliding window, 60 requests / 5 min / IP, bounded at 5000 entries. Defense-in-depth, not the primary control. For real production loads put rate limiting on a reverse proxy (Nginx `limit_req_zone`, Cloudflare WAF, Traefik).
 

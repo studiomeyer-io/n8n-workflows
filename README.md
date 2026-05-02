@@ -48,19 +48,19 @@ Detailed walkthrough per template lives inside each `templates/NN-slug/README.md
 
 | # | Template | Trigger | LLM | Production patterns | Status |
 |---|---|---|---|---|---|
-| 1 | [Form to CRM Lead Router](./templates/01-form-to-crm-lead-router/) | Form webhook | optional | HMAC, rate limit, idempotency, error branch | Hardened (v0.1.0) |
-| 2 | [Stripe Lifecycle to Slack](./templates/02-stripe-lifecycle-to-slack/) | Stripe webhook | none | HMAC (Stripe), rate limit, idempotency, error branch | Hardened (v0.1.0) |
+| 1 | [Form to CRM Lead Router](./templates/01-form-to-crm-lead-router/) | Form webhook | optional | HMAC, rate limit, idempotency with respond-duplicate gateway, error branch | Hardened (v0.3.1) |
+| 2 | [Stripe Lifecycle to Slack](./templates/02-stripe-lifecycle-to-slack/) | Stripe webhook | none | HMAC (Stripe), rate limit, idempotency with respond-duplicate gateway, error branch | Hardened (v0.3.1) |
 | 3 | [Uptime Monitor with Alerts](./templates/03-uptime-monitor-with-alerts/) | Schedule cron | none | rate limit, idempotency, error branch | Hardened (v0.1.0) |
 | 4 | [SSL Certificate Expiry Watcher](./templates/04-ssl-certificate-expiry-watcher/) | Schedule daily | none | rate limit, error branch | Hardened (v0.1.0) |
 | 5 | [Slack Channel Daily Digest](./templates/05-slack-channel-daily-digest/) | Schedule daily | yes (multi-provider) | rate limit, idempotency, error branch | Hardened (v0.1.0) |
-| 6 | [Calendly to CRM Sync](./templates/06-calendly-to-crm-sync/) | Calendly v2 webhook | none | HMAC (Calendly v2 + replay-window), rate limit, idempotency, error branch | Hardened (v0.2.0) |
-| 7 | [GitHub Issues Router](./templates/07-github-issues-to-tracker/) | GitHub webhook | none | HMAC (`X-Hub-Signature-256`), rate limit, idempotency on `X-GitHub-Delivery`, error branch | Hardened (v0.2.0) |
+| 6 | [Calendly to CRM Sync](./templates/06-calendly-to-crm-sync/) | Calendly v2 webhook | none | HMAC (Calendly v2 + replay-window), rate limit, idempotency with respond-duplicate gateway, error branch | Hardened (v0.3.1) |
+| 7 | [GitHub Issues Router](./templates/07-github-issues-to-tracker/) | GitHub webhook | none | HMAC (`X-Hub-Signature-256`), rate limit, idempotency on `X-GitHub-Delivery` with respond-duplicate gateway, error branch | Hardened (v0.3.1) |
 | 8 | [RSS to Multi-Channel Social](./templates/08-rss-to-multi-channel-social/) | Schedule cron | none | rate limit (per-feed-host), 7-day idempotency on guid, per-channel error branch | Hardened (v0.2.0) |
 | 9 | [Calendar Conflict Detector](./templates/09-calendar-conflict-detector/) | Schedule daily | none | rate limit (per-calendar), 24h idempotency on conflict-pair hash, per-calendar error branch | Hardened (v0.2.0) |
-| 10 | [CSV Bulk Validator](./templates/10-csv-bulk-validator/) | Webhook (CSV upload) | none | HMAC + replay-window, rate limit, idempotency on `sha256(rawBody)`, ReDoS-protected schema regexes, error branch | Hardened (v0.2.0) |
+| 10 | [CSV Bulk Validator](./templates/10-csv-bulk-validator/) | Webhook (CSV upload) | none | HMAC + replay-window, rate limit, idempotency on `sha256(rawBody)` with respond-duplicate gateway, ReDoS-protected schema regexes, error branch | Hardened (v0.3.1) |
 | 11 | [Email to Notion](./templates/11-email-to-notion/) | IMAP poll | none | filter (sender + subject opt-in), rate limit (Notion writes), idempotency on Message-ID hash, error branch | Hardened (v0.3.0) |
 | 12 | [Postgres to Google Sheets Sync](./templates/12-postgres-to-sheets-sync/) | Schedule daily | none | rate limit, idempotency on row PK (24h), `MAX_ROWS_PER_RUN` cap, HWM-only-on-success, error branch | Hardened (v0.3.0) |
-| 13 | [Webhook Audit Trail](./templates/13-webhook-audit-trail/) | Webhook (signed event ingest) | none | HMAC + replay-window, rate limit per IP, idempotency, hash-chain across rows, security + capacity Slack alerts | Hardened (v0.3.0) |
+| 13 | [Webhook Audit Trail](./templates/13-webhook-audit-trail/) | Webhook (signed event ingest) | none | HMAC + replay-window, rate limit per IP, idempotency, advisory-locked hash-chain across rows, security + capacity Slack alerts | Hardened (v0.3.1) |
 | 14 | [Telegram Translator Bot](./templates/14-telegram-translator-bot/) | Telegram | yes (multi-provider) | Telegram secret_token, rate limit per user_id, idempotency on update_id, LLM fallback with `isLlmError` discriminator, error branch | Hardened (v0.3.0) |
 | 15 | [YouTube Channel to Notion](./templates/15-youtube-channel-to-notion/) | Schedule daily | optional (multi-provider) | rate limit per host, 90d videoId idempotency, `MAX_VIDEOS_PER_CHANNEL_PER_RUN` cap, optional LLM summary, error branch | Hardened (v0.3.0) |
 

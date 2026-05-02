@@ -29,6 +29,10 @@ The result is a one-call CSV onboarding gate that catches malformed data before 
 [Idempotency Check (opt-in)]         <- IDEMPOTENCY_ENABLED=1, dedup on hash(rawBody)
     |
     v
+[Skip If Duplicate]   IF gateway on $json.skipped===true
+    +---- true ----> [Respond Duplicate]   200 OK + {deduped: true}
+    |
+    v false (live)
 [Parse CSV]                          <- quote-aware split, header row detection
     |
     v
@@ -131,7 +135,7 @@ Per-execution cost: **$0**. Pure CPU work, no external API.
 
 Four patterns ship as actual nodes in `workflow.json`. Three opt-in via env vars and one always-on error branch.
 
-**Idempotency** (opt-in, `IDEMPOTENCY_ENABLED=1`). The `Idempotency Check` Code node holds a 5-minute in-memory window of seen `sha256(rawBody)` hashes via `$getWorkflowStaticData('global')`. The same CSV uploaded twice within 5 minutes is recognized and short-circuited. For clustered n8n, swap to Redis `SET NX EX 300`. Snippet in the node's comments.
+**Idempotency** (opt-in, `IDEMPOTENCY_ENABLED=1`). The `Idempotency Check` Code node holds a 5-minute in-memory window of seen `sha256(rawBody)` hashes via `$getWorkflowStaticData('global')`. The same CSV uploaded twice within 5 minutes is recognized and short-circuited. On a duplicate the Idempotency Check emits a `{ skipped: true, reason: 'duplicate' }` sentinel that the `Skip If Duplicate` IF node routes to a dedicated `Respond Duplicate` `respondToWebhook` node returning 200 OK + `{ ok: true, deduped: true }`. Without that gateway, an `responseMode: responseNode` webhook would hold the connection open for 30 seconds on every duplicate and the source provider would log delivery failed. For clustered n8n, swap to Redis `SET NX EX 300`. Snippet in the node's comments.
 
 **Rate limiting** (opt-in, `RATE_LIMIT_ENABLED=1`). Per-IP sliding window, 60 requests / 5 min / IP, bounded at 5000 entries with eviction. Plus a hard `MAX_BODY_BYTES` cap (default 5MB) inside the parser to protect against giant uploads. For real production loads put rate limiting on a reverse proxy (Nginx `limit_req_zone`, Cloudflare WAF, Traefik).
 
