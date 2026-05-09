@@ -6,7 +6,12 @@
 
 # n8n Workflows · Production Patterns
 
-**Drop-in n8n workflows that ship the production patterns most public templates skip.**
+
+<!-- badges -->
+![License](https://img.shields.io/github/license/studiomeyer-io/n8n-workflows?style=flat-square&color=22c55e&label=license)
+![Last commit](https://img.shields.io/github/last-commit/studiomeyer-io/n8n-workflows?style=flat-square&color=88c0d0&label=updated)
+![GitHub stars](https://img.shields.io/github/stars/studiomeyer-io/n8n-workflows?style=flat-square&color=ffd700&logo=github&label=stars)
+<!-- /badges -->**Drop-in n8n workflows that ship the production patterns most public templates skip.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![n8n compatible](https://img.shields.io/badge/n8n-2.10.1%2B-FF6E5C.svg)](https://n8n.io)
