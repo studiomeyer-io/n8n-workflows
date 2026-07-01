@@ -30,7 +30,7 @@ jobs:
     name: examples/ JSON validity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Validate every example payload is valid JSON
         run: |
           set -eu
@@ -49,7 +49,7 @@ jobs:
     name: workflow.json <-> examples/ pairing
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Each template that needs an example payload has one
         run: |
           set -eu
@@ -76,7 +76,7 @@ jobs:
     name: execute Code-node snippets against example payloads
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: STUB - full harness pending
         run: |
           echo "::warning::Full Code-node snippet smoke-test is stubbed."
